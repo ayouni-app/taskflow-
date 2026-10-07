@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * Top 1 — one-page priority engine (Next.js App Router: app/page.tsx)
+ * Top 1 - one-page priority engine (Next.js App Router: app/page.tsx)
  * Deps: framer-motion, lucide-react.  Styling: inline CSS only.
  *
  * Method implemented:
@@ -34,7 +34,7 @@ import {
   Undo2,
 } from "lucide-react";
 
-/* ───────────────────────────── types ───────────────────────────── */
+/* ----------------------------- types ----------------------------- */
 
 type Rating = 1 | 2 | 3 | 4 | 5;
 type RateKey = "importance" | "urgency" | "consequence" | "opportunity";
@@ -70,8 +70,8 @@ interface LogEntry {
 }
 interface State {
   tasks: Task[];
-  sessions: Span[]; // focus time (end === null → running)
-  waits: Span[]; // blocked time (end === null → still waiting)
+  sessions: Span[]; // focus time (end === null -> running)
+  waits: Span[]; // blocked time (end === null -> still waiting)
   log: LogEntry[];
 }
 interface Row {
@@ -88,7 +88,7 @@ interface Advice {
   target?: Row;
 }
 
-/* ───────────────────────────── constants ───────────────────────────── */
+/* ----------------------------- constants ----------------------------- */
 
 const KEY = "top1:v1";
 const SWITCH_MARGIN = 12; // a rival must beat the active task by this many points
@@ -117,7 +117,7 @@ const RATINGS: { key: RateKey; label: string; hint: string }[] = [
   { key: "opportunity", label: "Opportunity", hint: "Upside that may expire" },
 ];
 
-/* ───────────────────────────── helpers ───────────────────────────── */
+/* ----------------------------- helpers ----------------------------- */
 
 const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(36);
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
@@ -173,7 +173,7 @@ const byRank = (a: Row, b: Row) =>
   (a.task.due ?? 9e15) - (b.task.due ?? 9e15) ||
   a.task.createdAt - b.task.createdAt;
 
-/* ───────────────────────────── state ───────────────────────────── */
+/* ----------------------------- state ----------------------------- */
 
 type Action =
   | { type: "hydrate"; state: State }
@@ -219,7 +219,7 @@ function reducer(s: State, a: Action): State {
       if (open?.taskId === a.id) return s;
       const from = open ? s.tasks.find((x) => x.id === open.taskId) : undefined;
       const e = open
-        ? entry(a.t, "switch", task, from ? `left “${from.title}”` : undefined)
+        ? entry(a.t, "switch", task, from ? `left \u201C${from.title}\u201D` : undefined)
         : entry(a.t, "start", task);
       return {
         tasks: setStatus(s.tasks, a.id, { status: "todo" }),
@@ -295,12 +295,12 @@ function load(): State | null {
       return p as State;
     }
   } catch {
-    /* corrupted or blocked storage → start clean */
+    /* corrupted or blocked storage -> start clean */
   }
   return null;
 }
 
-/* ───────────────────────────── small components ───────────────────────────── */
+/* ----------------------------- small components ----------------------------- */
 
 /** Ticks on its own so the page doesn't re-render every second. */
 function Live({ read, every = 1000 }: { read: (now: number) => string; every?: number }) {
@@ -420,7 +420,7 @@ const inputStyle: CSSProperties = {
   boxSizing: "border-box",
 };
 
-/* ───────────────────────────── page ───────────────────────────── */
+/* ----------------------------- page ----------------------------- */
 
 export default function Page() {
   const [state, dispatch] = useReducer(reducer, EMPTY);
@@ -485,7 +485,7 @@ export default function Page() {
     };
   }, []);
 
-  /* ── derived ── */
+  /* -- derived -- */
   const d = useMemo(() => {
     const open = state.sessions.find((x) => x.end === null) ?? null;
     const ranked: Row[] = state.tasks
@@ -504,7 +504,7 @@ export default function Page() {
           kind: "switch",
           key: `s:${activeRow.task.id}:${best.task.id}`,
           target: best,
-          text: `“${best.task.title}” now outranks this by ${Math.round(best.score - activeRow.score)} points. Switch only if it's worth the handoff.`,
+          text: `\u201C${best.task.title}\u201D now outranks this by ${Math.round(best.score - activeRow.score)} points. Switch only if it's worth the handoff.`,
         };
       } else if (activeRow.activeMs > activeRow.task.estMin * 60000 * 1.25) {
         advice = {
@@ -1023,7 +1023,7 @@ export default function Page() {
                   <div key={l.id} style={{ display: "flex", gap: 8 }}>
                     <span style={{ color: C.muted, width: 64, flexShrink: 0 }}>{fmtClock(l.t)}</span>
                     <span style={{ minWidth: 0, overflowWrap: "anywhere" }}>
-                      {LOG_VERB[l.type]} “{l.title}”{l.note ? `, ${l.note}` : ""}
+                      {LOG_VERB[l.type]} &ldquo;{l.title}&rdquo;{l.note ? `, ${l.note}` : ""}
                     </span>
                   </div>
                 ))}
