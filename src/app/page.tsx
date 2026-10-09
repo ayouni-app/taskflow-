@@ -6,7 +6,7 @@
  *
  * Method implemented:
  *  1. Timeline        -> planned schedule from "now" with due markers
- *  2. Priority tasks  -> each task has an estimate and optional due time
+ *  2. Priority tasks  -> estimate, optional fixed start/end, and ranked actions
  *  3. Rank at now     -> importance, urgency (raised automatically by deadlines),
  *                        consequence of neglect, opportunity
  *  4. Execute leader  -> one active task; interrupt only when switching/stopping wins
@@ -17,11 +17,12 @@
  */
 
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
-import type { CSSProperties, FormEvent, ReactNode } from "react";
+import type { CSSProperties, Dispatch, FormEvent, ReactNode } from "react";
 import { AnimatePresence, MotionConfig, motion } from "framer-motion";
 import {
   AlertTriangle,
   ArrowRightLeft,
+  CalendarClock,
   Check,
   ChevronDown,
   Download,
@@ -40,6 +41,16 @@ type Rating = 1 | 2 | 3 | 4 | 5;
 type RateKey = "importance" | "urgency" | "consequence" | "opportunity";
 type Status = "todo" | "waiting" | "done";
 
+type StepKey = "quality" | "probability" | "effort";
+interface Step {
+  id: string;
+  text: string;
+  quality: Rating; // results expected quality: higher is better
+  probability: Rating; // probability of success: higher is better
+  effort: Rating; // cognitive effort required: lower is better
+  done: boolean;
+  doneAt: number | null;
+}
 interface Task {
   id: string;
   title: string;
@@ -48,7 +59,9 @@ interface Task {
   consequence: Rating;
   opportunity: Rating;
   estMin: number;
-  due: number | null;
+  startAt: number | null; // fixed start: unavailable before this time
+  endAt: number | null; // fixed end: window closes (acts as the deadline)
+  steps: Step[];
   createdAt: number;
   status: Status;
   doneAt: number | null;
@@ -59,7 +72,7 @@ interface Span {
   start: number;
   end: number | null;
 }
-type LogType = "add" | "start" | "switch" | "pause" | "wait" | "unblock" | "done" | "reopen" | "remove";
+type LogType = "add" | "start" | "switch" | "pause" | "wait" | "unblock" | "done" | "reopen" | "remove" | "step";
 interface LogEntry {
   id: string;
   t: number;
@@ -80,9 +93,11 @@ interface Row {
   score: number;
   urgency: number;
   raisedByDeadline: boolean;
+  inWindow: boolean;
+  missed: boolean;
 }
 interface Advice {
-  kind: "switch" | "overrun";
+  kind: "switch" | "overrun" | "fixed";
   key: string;
   text: string;
   target?: Row;
@@ -93,6 +108,17 @@ interface Advice {
 const KEY = "top1:v1";
 const SWITCH_MARGIN = 12; // a rival must beat the active task by this many points
 const EMPTY: State = { tasks: [], sessions: [], waits: [], log: [] };
+const WINDOW_BONUS = 20; // a task whose fixed window is open outranks free-floating work
+const HEADS_UP_MIN = 10; // warn this many minutes before a fixed task starts
+
+const STEP_METRICS: { key: StepKey; label: string; short: string; hint: string }[] = [
+  { key: "quality", label: "Results expected quality", short: "Quality", hint: "Higher is better" },
+  { key: "probability", label: "Probability of success", short: "Success", hint: "Higher is better" },
+  { key: "effort", label: "Cognitive effort required", short: "Effort", hint: "Lower is better" },
+];
+/** Best next action = high quality, high success odds, low effort (effort is inverted). */
+const stepScore = (st: Step) =>
+  ((st.quality * 0.4 + st.probability * 0.35 + (6 - st.effort) * 0.25) / 5) * 100;
 
 const C = {
   bg: "#E8ECF3",
@@ -106,6 +132,7 @@ const C = {
   amber: "#B7791F",
   red: "#C0293B",
   green: "#26805A",
+  teal: "#0E7C86",
 };
 const HEAD = `"Bricolage Grotesque", "Segoe UI", system-ui, sans-serif`;
 const BODY = `"Instrument Sans", "Segoe UI", system-ui, sans-serif`;
@@ -149,6 +176,17 @@ const fmtDay = (ms: number, now: number) => {
 };
 const fmtDue = (due: number, now: number) =>
   due < now ? `Overdue by ${fmtDur(now - due)}` : `Due ${fmtDay(due, now)} ${fmtClock(due)}`;
+const fmtWhen = (t: Task, now: number) => {
+  const { startAt, endAt } = t;
+  if (endAt !== null && now >= endAt) return `Ended ${fmtDur(now - endAt)} ago`;
+  if (startAt !== null && now < startAt) {
+    return `Starts ${fmtDay(startAt, now)} ${fmtClock(startAt)}${endAt !== null ? `, ends ${fmtClock(endAt)}` : ""}`;
+  }
+  if (startAt !== null) {
+    return endAt !== null ? `Window open, ends ${fmtClock(endAt)} (in ${fmtDur(endAt - now)})` : `Started ${fmtClock(startAt)}`;
+  }
+  return endAt !== null ? fmtDue(endAt, now) : "";
+};
 
 const overlap = (spans: Span[], now: number, from: number, taskId?: string) =>
   spans.reduce((acc, s) => {
@@ -156,21 +194,24 @@ const overlap = (spans: Span[], now: number, from: number, taskId?: string) =>
     return acc + Math.max(0, (s.end ?? now) - Math.max(s.start, from));
   }, 0);
 
-/** Urgency is the higher of what you set and what the deadline demands right now. */
+/** Urgency is the higher of what you set and what the end time demands right now. */
 function scoreTask(task: Task, activeMs: number, now: number): Row {
   let derived = 1;
-  if (task.due !== null) {
+  if (task.endAt !== null) {
     const remaining = Math.max(5, task.estMin - activeMs / 60000) * 60000;
-    const slackH = (task.due - now - remaining) / 3600000;
+    const slackH = (task.endAt - now - remaining) / 3600000;
     derived = slackH <= 0 ? 5 : slackH < 1 ? 4.5 : slackH < 4 ? 4 : slackH < 24 ? 3 : slackH < 72 ? 2 : 1;
   }
+  const inWindow = task.startAt !== null && now >= task.startAt && (task.endAt === null || now < task.endAt);
+  const missed = task.endAt !== null && now >= task.endAt;
   const urgency = Math.max(task.urgency, derived);
-  const score = ((task.importance * 0.3 + urgency * 0.3 + task.consequence * 0.25 + task.opportunity * 0.15) / 5) * 100;
-  return { task, activeMs, score, urgency, raisedByDeadline: derived > task.urgency };
+  const base = ((task.importance * 0.3 + urgency * 0.3 + task.consequence * 0.25 + task.opportunity * 0.15) / 5) * 100;
+  const score = base + (inWindow ? WINDOW_BONUS : 0);
+  return { task, activeMs, score, urgency, raisedByDeadline: derived > task.urgency, inWindow, missed };
 }
 const byRank = (a: Row, b: Row) =>
   b.score - a.score ||
-  (a.task.due ?? 9e15) - (b.task.due ?? 9e15) ||
+  (a.task.endAt ?? 9e15) - (b.task.endAt ?? 9e15) ||
   a.task.createdAt - b.task.createdAt;
 
 /* ----------------------------- state ----------------------------- */
@@ -186,6 +227,10 @@ type Action =
   | { type: "reopen"; id: string; t: number }
   | { type: "remove"; id: string; t: number }
   | { type: "rate"; id: string; key: RateKey; value: Rating }
+  | { type: "addStep"; taskId: string; step: Step }
+  | { type: "toggleStep"; taskId: string; stepId: string; t: number }
+  | { type: "rateStep"; taskId: string; stepId: string; key: StepKey; value: Rating }
+  | { type: "removeStep"; taskId: string; stepId: string }
   | { type: "reset" };
 
 const closeSpans = (spans: Span[], t: number, taskId?: string): Span[] =>
@@ -211,7 +256,48 @@ function reducer(s: State, a: Action): State {
     case "add":
       return { ...s, tasks: [...s.tasks, a.task], log: withLog(s, entry(a.task.createdAt, "add", a.task)) };
     case "rate":
-      return { ...s, tasks: setStatus(s.tasks, a.id, { [a.key]: a.value }) };
+      return {
+        ...s,
+        tasks: s.tasks.map((x) => {
+          if (x.id !== a.id) return x;
+          const next: Task = { ...x };
+          next[a.key] = a.value;
+          return next;
+        }),
+      };
+    case "addStep": {
+      const task = s.tasks.find((x) => x.id === a.taskId);
+      if (!task) return s;
+      return { ...s, tasks: setStatus(s.tasks, a.taskId, { steps: [...task.steps, a.step] }) };
+    }
+    case "toggleStep": {
+      const task = s.tasks.find((x) => x.id === a.taskId);
+      const st = task?.steps.find((x) => x.id === a.stepId);
+      if (!task || !st) return s;
+      const nowDone = !st.done;
+      const steps = task.steps.map((x) => (x.id === a.stepId ? { ...x, done: nowDone, doneAt: nowDone ? a.t : null } : x));
+      return {
+        ...s,
+        tasks: setStatus(s.tasks, a.taskId, { steps }),
+        log: nowDone ? withLog(s, entry(a.t, "step", task, st.text)) : s.log,
+      };
+    }
+    case "rateStep": {
+      const task = s.tasks.find((x) => x.id === a.taskId);
+      if (!task) return s;
+      const steps = task.steps.map((x) => {
+        if (x.id !== a.stepId) return x;
+        const next: Step = { ...x };
+        next[a.key] = a.value;
+        return next;
+      });
+      return { ...s, tasks: setStatus(s.tasks, a.taskId, { steps }) };
+    }
+    case "removeStep": {
+      const task = s.tasks.find((x) => x.id === a.taskId);
+      if (!task) return s;
+      return { ...s, tasks: setStatus(s.tasks, a.taskId, { steps: task.steps.filter((x) => x.id !== a.stepId) }) };
+    }
     case "start": {
       const task = s.tasks.find((x) => x.id === a.id);
       if (!task || task.status === "done") return s;
@@ -286,13 +372,20 @@ function reducer(s: State, a: Action): State {
   }
 }
 
+type LegacyTask = Omit<Task, "startAt" | "endAt" | "steps"> &
+  Partial<Pick<Task, "startAt" | "endAt" | "steps">> & { due?: number | null };
+function migrate(t: LegacyTask): Task {
+  const { due, ...rest } = t;
+  return { ...rest, startAt: rest.startAt ?? null, endAt: rest.endAt ?? due ?? null, steps: rest.steps ?? [] };
+}
+
 function load(): State | null {
   try {
     const raw = localStorage.getItem(KEY);
     if (!raw) return null;
     const p = JSON.parse(raw) as Partial<State>;
     if (Array.isArray(p.tasks) && Array.isArray(p.sessions) && Array.isArray(p.waits) && Array.isArray(p.log)) {
-      return p as State;
+      return { ...(p as State), tasks: (p.tasks as unknown as LegacyTask[]).map(migrate) };
     }
   } catch {
     /* corrupted or blocked storage -> start clean */
@@ -420,6 +513,111 @@ const inputStyle: CSSProperties = {
   boxSizing: "border-box",
 };
 
+const chipBtn: CSSProperties = {
+  minHeight: 36,
+  padding: "0 12px",
+  borderRadius: 999,
+  border: `1px solid ${C.line}`,
+  background: "#fff",
+  color: C.ink,
+  fontFamily: BODY,
+  fontWeight: 600,
+  fontSize: 13,
+  cursor: "pointer",
+};
+
+function RatingGrid({ task, dispatch }: { task: Task; dispatch: Dispatch<Action> }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 230px), 1fr))", gap: 12, paddingTop: 12 }}>
+      {RATINGS.map((rt) => (
+        <RatingInput
+          key={rt.key}
+          label={rt.label}
+          hint={rt.hint}
+          value={task[rt.key]}
+          onChange={(value) => dispatch({ type: "rate", id: task.id, key: rt.key, value })}
+        />
+      ))}
+    </div>
+  );
+}
+
+/** Actions inside a task, each rated: quality up, success odds up, effort down. */
+function StepEditor({ task, dispatch }: { task: Task; dispatch: Dispatch<Action> }) {
+  const [text, setText] = useState("");
+  const [vals, setVals] = useState<Record<StepKey, Rating>>({ quality: 3, probability: 3, effort: 3 });
+  const sorted = [...task.steps].sort((a, b) => Number(a.done) - Number(b.done) || stepScore(b) - stepScore(a));
+  const add = () => {
+    const clean = text.trim();
+    if (!clean) return;
+    dispatch({ type: "addStep", taskId: task.id, step: { id: uid(), text: clean, ...vals, done: false, doneAt: null } });
+    setText("");
+    setVals({ quality: 3, probability: 3, effort: 3 });
+  };
+  return (
+    <div style={{ display: "grid", gap: 10 }}>
+      <div style={{ fontWeight: 600, fontSize: 14 }}>Actions, best next first</div>
+      {sorted.length === 0 && <span style={{ color: C.muted, fontSize: 13 }}>No actions yet.</span>}
+      {sorted.map((st) => (
+        <div
+          key={st.id}
+          style={{ display: "grid", gap: 6, border: `1px solid ${C.line}`, borderRadius: 10, padding: "8px 10px", background: st.done ? C.track : "#fff" }}
+        >
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <Btn
+              variant={st.done ? "solid" : "ghost"}
+              icon={<Check size={16} />}
+              title={st.done ? "Mark not done" : "Mark done"}
+              onClick={() => dispatch({ type: "toggleStep", taskId: task.id, stepId: st.id, t: Date.now() })}
+            />
+            <span style={{ flex: 1, minWidth: 0, overflowWrap: "anywhere", fontSize: 14, textDecoration: st.done ? "line-through" : "none", color: st.done ? C.muted : C.ink }}>
+              {st.text}
+            </span>
+            <span style={{ fontSize: 12, color: C.muted }} title="Action score">{Math.round(stepScore(st))}</span>
+            <Btn variant="danger" icon={<Trash2 size={15} />} title="Delete action" onClick={() => dispatch({ type: "removeStep", taskId: task.id, stepId: st.id })} />
+          </div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {STEP_METRICS.map((m) => (
+              <button
+                key={m.key}
+                type="button"
+                title={`${m.label}. ${m.hint}. Tap to change.`}
+                onClick={() => dispatch({ type: "rateStep", taskId: task.id, stepId: st.id, key: m.key, value: ((st[m.key] % 5) + 1) as Rating })}
+                style={chipBtn}
+              >
+                {m.short} {st[m.key]}
+              </button>
+            ))}
+          </div>
+        </div>
+      ))}
+      <div style={{ display: "grid", gap: 10, borderTop: `1px solid ${C.line}`, paddingTop: 10 }}>
+        <input
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              add();
+            }
+          }}
+          placeholder="A specific action for this task"
+          aria-label="New action"
+          style={inputStyle}
+        />
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 230px), 1fr))", gap: 12 }}>
+          {STEP_METRICS.map((m) => (
+            <RatingInput key={m.key} label={m.label} hint={m.hint} value={vals[m.key]} onChange={(v) => setVals((p) => ({ ...p, [m.key]: v }))} />
+          ))}
+        </div>
+        <div>
+          <Btn variant="solid" icon={<Plus size={16} />} onClick={add}>Add action</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ----------------------------- page ----------------------------- */
 
 export default function Page() {
@@ -432,7 +630,9 @@ export default function Page() {
 
   const [title, setTitle] = useState("");
   const [est, setEst] = useState("25");
-  const [due, setDue] = useState("");
+  const [startAt, setStartAt] = useState("");
+  const [endAt, setEndAt] = useState("");
+  const [formError, setFormError] = useState("");
   const [draft, setDraft] = useState<Record<RateKey, Rating>>({
     importance: 3,
     urgency: 3,
@@ -488,23 +688,33 @@ export default function Page() {
   /* -- derived -- */
   const d = useMemo(() => {
     const open = state.sessions.find((x) => x.end === null) ?? null;
-    const ranked: Row[] = state.tasks
-      .filter((t) => t.status === "todo")
+    const todo = state.tasks.filter((t) => t.status === "todo");
+    const available = (t: Task) => t.startAt === null || now >= t.startAt || t.id === open?.taskId;
+    const ranked: Row[] = todo
+      .filter(available)
       .map((t) => scoreTask(t, overlap(state.sessions, now, 0, t.id), now))
       .sort(byRank);
+    const upcoming = todo.filter((t) => !available(t)).sort((a, b) => (a.startAt ?? 0) - (b.startAt ?? 0));
     const activeRow = open ? ranked.find((r) => r.task.id === open.taskId) ?? null : null;
     const lead = ranked[0] ?? null;
     const focus = activeRow ?? lead;
 
     let advice: Advice | null = null;
-    if (activeRow) {
+    const nextFixed = upcoming[0] ?? null;
+    if (nextFixed && nextFixed.startAt !== null && nextFixed.startAt - now <= HEADS_UP_MIN * 60000) {
+      advice = {
+        kind: "fixed",
+        key: `f:${nextFixed.id}`,
+        text: `\u201C${nextFixed.title}\u201D starts at ${fmtClock(nextFixed.startAt)} (in ${fmtDur(nextFixed.startAt - now)}). ${activeRow ? "Wrap up or pause this one." : "Only start something short before then."}`,
+      };
+    } else if (activeRow) {
       const best = ranked.find((r) => r.task.id !== activeRow.task.id);
       if (best && best.score > activeRow.score + SWITCH_MARGIN) {
         advice = {
           kind: "switch",
           key: `s:${activeRow.task.id}:${best.task.id}`,
           target: best,
-          text: `\u201C${best.task.title}\u201D now outranks this by ${Math.round(best.score - activeRow.score)} points. Switch only if it's worth the handoff.`,
+          text: `\u201C${best.task.title}\u201D now outranks this by ${Math.round(best.score - activeRow.score)} points${best.inWindow ? " and its time window is open" : ""}. Switch only if it's worth the handoff.`,
         };
       } else if (activeRow.activeMs > activeRow.task.estMin * 60000 * 1.25) {
         advice = {
@@ -515,19 +725,54 @@ export default function Page() {
       }
     }
 
-    /* timeline: active task first (don't thrash), then by rank */
-    const order = [...(activeRow ? [activeRow] : []), ...ranked.filter((r) => r.task.id !== activeRow?.task.id)];
-    let cursor = 0;
-    const blocks = order.map((r) => {
-      const dur = Math.max(5, r.task.estMin - r.activeMs / 60000);
-      const startMin = cursor;
-      cursor += dur;
-      const endMs = now + cursor * 60000;
-      return { ...r, startMin, durMin: dur, endMs, late: r.task.due !== null && endMs > r.task.due };
+    /* timeline: fixed windows are immovable; the active task goes first,
+       then everything else is fitted by rank into the earliest gap that holds it */
+    const toMin = (ms: number) => (ms - now) / 60000;
+    const busy: { s: number; e: number }[] = [];
+    const fixedRaw = upcoming.map((t) => {
+      const s0 = toMin(t.startAt ?? now);
+      const e0 = t.endAt !== null ? toMin(t.endAt) : s0 + t.estMin;
+      busy.push({ s: s0, e: e0 });
+      return { row: scoreTask(t, 0, now), s: s0, e: e0 };
     });
-    const total = cursor;
+    const clash = new Set<string>();
+    const fx = [...fixedRaw].sort((a, b) => a.s - b.s);
+    fx.forEach((b, i) => {
+      const n = fx[i + 1];
+      if (n && n.s < b.e) {
+        clash.add(b.row.task.id);
+        clash.add(n.row.task.id);
+      }
+    });
+    const fit = (dur: number) => {
+      let start = 0;
+      for (const b of [...busy].sort((x, y) => x.s - y.s)) {
+        if (start + dur <= b.s) break;
+        start = Math.max(start, b.e);
+      }
+      return start;
+    };
+    const flexible = [...(activeRow ? [activeRow] : []), ...ranked.filter((r) => r.task.id !== activeRow?.task.id)];
+    const flexBlocks = flexible.map((r) => {
+      const dur = Math.max(5, r.task.estMin - r.activeMs / 60000);
+      const startMin = r === activeRow ? 0 : fit(dur);
+      busy.push({ s: startMin, e: startMin + dur });
+      const endMs = now + (startMin + dur) * 60000;
+      return { ...r, startMin, durMin: dur, endMs, late: r.task.endAt !== null && endMs > r.task.endAt, fixed: false, clash: false };
+    });
+    const fixedBlocks = fixedRaw.map((b) => ({
+      ...b.row,
+      startMin: b.s,
+      durMin: Math.max(5, b.e - b.s),
+      endMs: now + b.e * 60000,
+      late: false,
+      fixed: true,
+      clash: clash.has(b.row.task.id),
+    }));
+    const blocks = [...fixedBlocks, ...flexBlocks].sort((a, b) => a.startMin - b.startMin);
+    const total = blocks.reduce((m, b) => Math.max(m, b.startMin + b.durMin), 0);
     const dueMins = blocks
-      .map((b) => (b.task.due !== null ? (b.task.due - now) / 60000 : 0))
+      .map((b) => (b.task.endAt !== null ? toMin(b.task.endAt) : 0))
       .filter((m) => m > 0 && m <= Math.max(total * 2, 120));
     const horizon = Math.max(60, total, ...dueMins) * 1.05;
 
@@ -538,6 +783,7 @@ export default function Page() {
     const focusMs = overlap(state.sessions, now, from);
     const waitMs = overlap(state.waits, now, from);
     const switches = state.log.filter((l) => l.type === "switch" && l.t >= from).length;
+    const stepsToday = state.tasks.reduce((a, t) => a + t.steps.filter((x) => x.doneAt !== null && x.doneAt >= from).length, 0);
 
     return {
       open,
@@ -548,6 +794,8 @@ export default function Page() {
       advice,
       blocks,
       horizon,
+      upcoming,
+      stepsToday,
       doneToday: doneToday.length,
       value,
       focusMs,
@@ -575,22 +823,36 @@ export default function Page() {
     e.preventDefault();
     const clean = title.trim();
     if (!clean) return;
-    const dueMs = due ? new Date(due).getTime() : NaN;
+    const sRaw = startAt ? new Date(startAt).getTime() : NaN;
+    const eRaw = endAt ? new Date(endAt).getTime() : NaN;
+    const startMs = Number.isNaN(sRaw) ? null : sRaw;
+    const endMs = Number.isNaN(eRaw) ? null : eRaw;
+    if (startMs !== null && endMs !== null && endMs <= startMs) {
+      setFormError("The end time must be after the start time.");
+      return;
+    }
+    setFormError("");
     dispatch({
       type: "add",
       task: {
         id: uid(),
         title: clean,
         ...draft,
-        estMin: clamp(Math.round(Number(est)) || 25, 5, 600),
-        due: Number.isNaN(dueMs) ? null : dueMs,
+        estMin:
+          startMs !== null && endMs !== null
+            ? clamp(Math.round((endMs - startMs) / 60000), 5, 1440)
+            : clamp(Math.round(Number(est)) || 25, 5, 1440),
+        startAt: startMs,
+        endAt: endMs,
+        steps: [],
         createdAt: Date.now(),
         status: "todo",
         doneAt: null,
       },
     });
     setTitle("");
-    setDue("");
+    setStartAt("");
+    setEndAt("");
     setEst("25");
     setDraft({ importance: 3, urgency: 3, consequence: 3, opportunity: 3 });
   };
@@ -622,6 +884,9 @@ export default function Page() {
   }
 
   const { focus, activeRow, advice } = d;
+  const focusSteps = focus ? focus.task.steps : [];
+  const pendingSteps = focusSteps.filter((x) => !x.done).sort((a, b) => stepScore(b) - stepScore(a));
+  const nextStep = pendingSteps[0] ?? null;
   const showAdvice = advice && advice.key !== dismissed;
   const pct = activeRow ? clamp((activeRow.activeMs / (activeRow.task.estMin * 60000)) * 100, 0, 100) : 0;
   const axis = [0, 0.25, 0.5, 0.75, 1].map((f) => now + f * d.horizon * 60000);
@@ -658,7 +923,7 @@ export default function Page() {
               <>
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", fontSize: 14, opacity: 0.9 }}>
                   <span>{activeRow ? "In progress" : "Next up"}</span>
-                  <span>Priority {Math.round(focus.score)} of 100</span>
+                  <span>Priority {Math.round(focus.score)}</span>
                 </div>
 
                 <AnimatePresence mode="wait" initial={false}>
@@ -698,7 +963,7 @@ export default function Page() {
                 ) : (
                   <div style={{ fontSize: 15, opacity: 0.92 }}>
                     {focus.task.estMin} min planned
-                    {focus.task.due !== null ? `. ${fmtDue(focus.task.due, now)}` : ""}
+                    {fmtWhen(focus.task, now) ? `. ${fmtWhen(focus.task, now)}` : ""}
                   </div>
                 )}
 
@@ -718,6 +983,38 @@ export default function Page() {
                       {raised ? " (deadline)" : ""}
                     </span>
                   ))}
+                </div>
+
+                <div style={{ background: "rgba(255,255,255,0.14)", borderRadius: 12, padding: "10px 12px", display: "grid", gap: 8 }}>
+                  {nextStep ? (
+                    <>
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ fontSize: 13, opacity: 0.85 }}>
+                            Next action ({focusSteps.length - pendingSteps.length} of {focusSteps.length} done)
+                          </div>
+                          <div style={{ fontWeight: 600, fontSize: 16, overflowWrap: "anywhere" }}>{nextStep.text}</div>
+                        </div>
+                        <Btn
+                          variant="onBlue"
+                          icon={<Check size={18} />}
+                          title="Complete this action"
+                          onClick={() => dispatch({ type: "toggleStep", taskId: focus.task.id, stepId: nextStep.id, t: Date.now() })}
+                        />
+                      </div>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                        {STEP_METRICS.map((m) => (
+                          <span key={m.key} title={`${m.label}. ${m.hint}`} style={{ background: "rgba(255,255,255,0.16)", borderRadius: 999, padding: "3px 10px", fontSize: 12, fontWeight: 500 }}>
+                            {m.short} {nextStep[m.key]}
+                          </span>
+                        ))}
+                      </div>
+                    </>
+                  ) : (
+                    <div style={{ fontSize: 14, opacity: 0.92 }}>
+                      {focusSteps.length ? "All actions are done. Finish the task." : "No actions yet. Open this task in the list below to add some."}
+                    </div>
+                  )}
                 </div>
 
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
@@ -772,7 +1069,7 @@ export default function Page() {
             <Metric
               label="Valuable output"
               big={String(d.value)}
-              note={`${d.doneToday} finished today${d.focusMs > 60000 ? `, ${(d.value / (d.focusMs / 3600000)).toFixed(1)} per focus hour` : ""}`}
+              note={`${d.doneToday} finished, ${d.stepsToday} actions today${d.focusMs > 60000 ? `, ${(d.value / (d.focusMs / 3600000)).toFixed(1)} per focus hour` : ""}`}
             />
             <Metric
               label="Waiting time"
@@ -791,7 +1088,7 @@ export default function Page() {
           {/* timeline */}
           <section style={card}>
             <h3 style={h3}>Timeline from now</h3>
-            <p style={sub}>Projected order. The vertical tick on a row is its due time; red means it is projected to finish late.</p>
+            <p style={sub}>Projected order. Teal bars are fixed-time tasks. The vertical tick is an end time; red means a late finish or a clash.</p>
             {d.blocks.length === 0 ? (
               <p style={{ color: C.muted, margin: "14px 0 0", fontSize: 14 }}>Add tasks to see your day laid out.</p>
             ) : (
@@ -800,8 +1097,8 @@ export default function Page() {
                   {d.blocks.map((b, i) => {
                     const left = (b.startMin / d.horizon) * 100;
                     const width = Math.max(1.5, (b.durMin / d.horizon) * 100);
-                    const dueLeft = b.task.due !== null ? clamp(((b.task.due - now) / 60000 / d.horizon) * 100, 0, 100) : null;
-                    const color = b.late ? C.red : i === 0 && activeRow ? C.blue : C.blueSoft;
+                    const dueLeft = !b.fixed && b.task.endAt !== null ? clamp(((b.task.endAt - now) / 60000 / d.horizon) * 100, 0, 100) : null;
+                    const color = b.late || b.clash ? C.red : b.fixed ? C.teal : b.task.id === activeRow?.task.id ? C.blue : C.blueSoft;
                     return (
                       <motion.div
                         key={b.task.id}
@@ -812,7 +1109,7 @@ export default function Page() {
                         style={{ display: "grid", gap: 4 }}
                       >
                         <div style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 13 }}>
-                          <span style={{ ...ellipsis, fontWeight: 600 }}>{b.task.title}</span>
+                          <span style={{ ...ellipsis, fontWeight: 600 }}>{b.task.title}{b.fixed ? " (fixed)" : ""}{b.clash ? ", overlaps another fixed task" : ""}</span>
                           <span style={{ color: C.muted, flexShrink: 0 }}>
                             {fmtClock(now + b.startMin * 60000)} to {fmtClock(b.endMs)}
                           </span>
@@ -826,8 +1123,8 @@ export default function Page() {
                           />
                           {dueLeft !== null && (
                             <div
-                              title={fmtDue(b.task.due!, now)}
-                              style={{ position: "absolute", left: `${dueLeft}%`, top: -3, bottom: -3, width: 2, background: b.task.due! < now ? C.red : C.ink }}
+                              title={fmtWhen(b.task, now)}
+                              style={{ position: "absolute", left: `${dueLeft}%`, top: -3, bottom: -3, width: 2, background: b.task.endAt !== null && b.task.endAt < now ? C.red : C.ink }}
                             />
                           )}
                         </div>
@@ -872,9 +1169,10 @@ export default function Page() {
                           style={{ flex: 1, minWidth: 0, textAlign: "left", background: "none", border: "none", padding: "4px 0", cursor: "pointer", fontFamily: BODY, color: C.ink }}
                         >
                           <div style={{ ...ellipsis, fontWeight: 600, fontSize: 15 }}>{r.task.title}</div>
-                          <div style={{ fontSize: 12, color: r.task.due !== null && r.task.due < now ? C.red : C.muted, marginTop: 2 }}>
+                          <div style={{ fontSize: 12, color: r.missed ? C.red : r.inWindow ? C.teal : C.muted, marginTop: 2 }}>
                             Score {Math.round(r.score)}, {r.task.estMin} min
-                            {r.task.due !== null ? `, ${fmtDue(r.task.due, now)}` : ""}
+                            {fmtWhen(r.task, now) ? `, ${fmtWhen(r.task, now)}` : ""}
+                            {r.task.steps.length ? `, ${r.task.steps.filter((x) => x.done).length}/${r.task.steps.length} actions` : ""}
                           </div>
                         </button>
                         {isActive ? (
@@ -906,6 +1204,7 @@ export default function Page() {
                                   />
                                 ))}
                               </div>
+                              <StepEditor task={r.task} dispatch={dispatch} />
                               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                                 <Btn icon={<Check size={16} />} onClick={() => act.done(r.task.id)}>Done</Btn>
                                 <Btn icon={<Hourglass size={16} />} onClick={() => act.wait(r.task.id)}>Blocked</Btn>
@@ -922,6 +1221,49 @@ export default function Page() {
               {d.ranked.length === 0 && <p style={{ color: C.muted, margin: 0, fontSize: 14 }}>No open tasks.</p>}
             </div>
           </section>
+
+          {/* scheduled (fixed start in the future) */}
+          {d.upcoming.length > 0 && (
+            <section style={card}>
+              <h3 style={h3}>Scheduled</h3>
+              <p style={sub}>Fixed-time tasks. They join the ranking when their start time arrives.</p>
+              <div style={{ display: "grid", gap: 8, marginTop: 14 }}>
+                {d.upcoming.map((t) => {
+                  const isOpen = openId === t.id;
+                  return (
+                    <div key={t.id} style={{ border: `1px solid ${C.line}`, borderRadius: 12, background: "#fff", overflow: "hidden" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 10px 10px 14px" }}>
+                        <CalendarClock size={18} color={C.teal} style={{ flexShrink: 0 }} />
+                        <button
+                          type="button"
+                          onClick={() => setOpenId(isOpen ? null : t.id)}
+                          aria-expanded={isOpen}
+                          style={{ flex: 1, minWidth: 0, textAlign: "left", background: "none", border: "none", padding: "4px 0", cursor: "pointer", fontFamily: BODY, color: C.ink }}
+                        >
+                          <div style={{ ...ellipsis, fontWeight: 600, fontSize: 15 }}>{t.title}</div>
+                          <div style={{ fontSize: 12, color: C.teal, marginTop: 2 }}>
+                            {fmtWhen(t, now)}
+                            {t.steps.length ? `, ${t.steps.filter((x) => x.done).length}/${t.steps.length} actions` : ""}
+                          </div>
+                        </button>
+                        <Btn icon={<Play size={18} />} title="Start early" onClick={() => act.start(t.id)} />
+                      </div>
+                      {isOpen && (
+                        <div style={{ padding: "4px 14px 14px", display: "grid", gap: 12, borderTop: `1px solid ${C.line}` }}>
+                          <RatingGrid task={t} dispatch={dispatch} />
+                          <StepEditor task={t} dispatch={dispatch} />
+                          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                            <Btn icon={<Check size={16} />} onClick={() => act.done(t.id)}>Done</Btn>
+                            <Btn variant="danger" icon={<Trash2 size={16} />} onClick={() => act.remove(t.id)}>Delete</Btn>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+          )}
 
           {/* waiting */}
           <AnimatePresence initial={false}>
@@ -972,12 +1314,19 @@ export default function Page() {
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 200px), 1fr))", gap: 12 }}>
                 <label style={{ display: "grid", gap: 6, fontSize: 13, fontWeight: 600 }}>
                   Estimate (minutes)
-                  <input type="number" inputMode="numeric" min={5} max={600} step={5} value={est} onChange={(e) => setEst(e.target.value)} style={inputStyle} />
+                  <input type="number" inputMode="numeric" min={5} max={1440} step={5} value={est} onChange={(e) => setEst(e.target.value)} disabled={Boolean(startAt && endAt)} style={{ ...inputStyle, opacity: startAt && endAt ? 0.5 : 1 }} />
                 </label>
                 <label style={{ display: "grid", gap: 6, fontSize: 13, fontWeight: 600 }}>
-                  Due (optional)
-                  <input type="datetime-local" value={due} onChange={(e) => setDue(e.target.value)} style={inputStyle} />
+                  Starts at (optional)
+                  <input type="datetime-local" value={startAt} onChange={(e) => setStartAt(e.target.value)} style={inputStyle} />
                 </label>
+                <label style={{ display: "grid", gap: 6, fontSize: 13, fontWeight: 600 }}>
+                  Ends by (optional)
+                  <input type="datetime-local" value={endAt} onChange={(e) => setEndAt(e.target.value)} style={inputStyle} />
+                </label>
+                <p style={{ ...sub, margin: 0, gridColumn: "1 / -1" }}>
+                  Set a start time for tasks that only apply at a specific time. Add an end time to make it a window; the estimate then follows the window length.
+                </p>
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 230px), 1fr))", gap: 14 }}>
                 {RATINGS.map((rt) => (
@@ -991,6 +1340,11 @@ export default function Page() {
                 ))}
               </div>
               <div>
+                {formError && (
+                  <div role="alert" style={{ color: C.red, fontSize: 13, marginBottom: 8 }}>
+                    {formError}
+                  </div>
+                )}
                 <Btn type="submit" variant="solid" icon={<Plus size={18} />}>Add task</Btn>
               </div>
             </form>
@@ -1058,6 +1412,7 @@ const LOG_VERB: Record<LogType, string> = {
   done: "Finished",
   reopen: "Reopened",
   remove: "Deleted",
+  step: "Completed an action on",
 };
 
 function Metric(p: { label: string; big: string; note: string; tone?: string }) {
