@@ -41,10 +41,12 @@ type Rating = 1 | 2 | 3 | 4 | 5;
 type RateKey = "importance" | "urgency" | "consequence" | "opportunity";
 type Status = "todo" | "waiting" | "done";
 
+type Phase = "before" | "during" | "after";
 type StepKey = "quality" | "probability" | "effort";
 interface Step {
   id: string;
   text: string;
+  phase: Phase; // when in the task this action happens
   quality: Rating; // results expected quality: higher is better
   probability: Rating; // probability of success: higher is better
   effort: Rating; // cognitive effort required: lower is better
@@ -119,6 +121,30 @@ const STEP_METRICS: { key: StepKey; label: string; short: string; hint: string }
 /** Best next action = high quality, high success odds, low effort (effort is inverted). */
 const stepScore = (st: Step) =>
   ((st.quality * 0.4 + st.probability * 0.35 + (6 - st.effort) * 0.25) / 5) * 100;
+
+const PHASES: { key: Phase; label: string; hint: string }[] = [
+  { key: "before", label: "Before", hint: "Set up: what makes the work possible" },
+  { key: "during", label: "During", hint: "Do the work itself" },
+  { key: "after", label: "After", hint: "Close out: verify, hand off, follow up" },
+];
+/**
+ * Per phase, the options compete: the highest-scoring action wins and is the way the
+ * task gets done. Doing any option completes the phase (that one is then "used").
+ * Current phase = first phase that has options and is not complete.
+ */
+function phasePlan(task: Task) {
+  return PHASES.map((ph) => {
+    const steps = task.steps
+      .filter((x) => x.phase === ph.key)
+      .sort((a, b) => Number(b.done) - Number(a.done) || stepScore(b) - stepScore(a));
+    const winner: Step | null = steps[0] ?? null;
+    return { phase: ph.key, label: ph.label, steps, winner, complete: winner?.done ?? false };
+  });
+}
+const planProgress = (t: Task) => {
+  const active = phasePlan(t).filter((x) => x.steps.length > 0);
+  return active.length ? `, ${active.filter((x) => x.complete).length}/${active.length} phases done` : "";
+};
 
 const C = {
   bg: "#E8ECF3",
@@ -279,7 +305,7 @@ function reducer(s: State, a: Action): State {
       return {
         ...s,
         tasks: setStatus(s.tasks, a.taskId, { steps }),
-        log: nowDone ? withLog(s, entry(a.t, "step", task, st.text)) : s.log,
+        log: nowDone ? withLog(s, entry(a.t, "step", task, `${st.phase}: ${st.text}`)) : s.log,
       };
     }
     case "rateStep": {
@@ -376,7 +402,7 @@ type LegacyTask = Omit<Task, "startAt" | "endAt" | "steps"> &
   Partial<Pick<Task, "startAt" | "endAt" | "steps">> & { due?: number | null };
 function migrate(t: LegacyTask): Task {
   const { due, ...rest } = t;
-  return { ...rest, startAt: rest.startAt ?? null, endAt: rest.endAt ?? due ?? null, steps: rest.steps ?? [] };
+  return { ...rest, startAt: rest.startAt ?? null, endAt: rest.endAt ?? due ?? null, steps: (rest.steps ?? []).map((st) => ({ ...st, phase: st.phase ?? "during" })) };
 }
 
 function load(): State | null {
@@ -542,56 +568,95 @@ function RatingGrid({ task, dispatch }: { task: Task; dispatch: Dispatch<Action>
   );
 }
 
-/** Actions inside a task, each rated: quality up, success odds up, effort down. */
+/** Before / During / After. In each phase the best-scoring option wins and becomes the way the task is done. */
 function StepEditor({ task, dispatch }: { task: Task; dispatch: Dispatch<Action> }) {
+  const [phase, setPhase] = useState<Phase>("during");
   const [text, setText] = useState("");
   const [vals, setVals] = useState<Record<StepKey, Rating>>({ quality: 3, probability: 3, effort: 3 });
-  const sorted = [...task.steps].sort((a, b) => Number(a.done) - Number(b.done) || stepScore(b) - stepScore(a));
+  const plan = phasePlan(task);
   const add = () => {
     const clean = text.trim();
     if (!clean) return;
-    dispatch({ type: "addStep", taskId: task.id, step: { id: uid(), text: clean, ...vals, done: false, doneAt: null } });
+    dispatch({ type: "addStep", taskId: task.id, step: { id: uid(), text: clean, phase, ...vals, done: false, doneAt: null } });
     setText("");
     setVals({ quality: 3, probability: 3, effort: 3 });
   };
   return (
-    <div style={{ display: "grid", gap: 10 }}>
-      <div style={{ fontWeight: 600, fontSize: 14 }}>Actions, best next first</div>
-      {sorted.length === 0 && <span style={{ color: C.muted, fontSize: 13 }}>No actions yet.</span>}
-      {sorted.map((st) => (
-        <div
-          key={st.id}
-          style={{ display: "grid", gap: 6, border: `1px solid ${C.line}`, borderRadius: 10, padding: "8px 10px", background: st.done ? C.track : "#fff" }}
-        >
-          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <Btn
-              variant={st.done ? "solid" : "ghost"}
-              icon={<Check size={16} />}
-              title={st.done ? "Mark not done" : "Mark done"}
-              onClick={() => dispatch({ type: "toggleStep", taskId: task.id, stepId: st.id, t: Date.now() })}
-            />
-            <span style={{ flex: 1, minWidth: 0, overflowWrap: "anywhere", fontSize: 14, textDecoration: st.done ? "line-through" : "none", color: st.done ? C.muted : C.ink }}>
-              {st.text}
-            </span>
-            <span style={{ fontSize: 12, color: C.muted }} title="Action score">{Math.round(stepScore(st))}</span>
-            <Btn variant="danger" icon={<Trash2 size={15} />} title="Delete action" onClick={() => dispatch({ type: "removeStep", taskId: task.id, stepId: st.id })} />
+    <div style={{ display: "grid", gap: 14 }}>
+      {plan.map((p) => (
+        <div key={p.phase} style={{ display: "grid", gap: 6 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+            <span style={{ fontWeight: 700, fontSize: 15, fontFamily: HEAD }}>{p.label}</span>
+            <span style={{ fontSize: 12, color: C.muted }}>{PHASES.find((x) => x.key === p.phase)?.hint}</span>
           </div>
-          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-            {STEP_METRICS.map((m) => (
-              <button
-                key={m.key}
-                type="button"
-                title={`${m.label}. ${m.hint}. Tap to change.`}
-                onClick={() => dispatch({ type: "rateStep", taskId: task.id, stepId: st.id, key: m.key, value: ((st[m.key] % 5) + 1) as Rating })}
-                style={chipBtn}
-              >
-                {m.short} {st[m.key]}
-              </button>
-            ))}
-          </div>
+          {p.steps.length === 0 && <span style={{ color: C.muted, fontSize: 13 }}>No options yet.</span>}
+          {p.steps.map((st, i) => (
+            <div
+              key={st.id}
+              style={{
+                display: "grid",
+                gap: 6,
+                border: `1px solid ${i === 0 ? C.blue : C.line}`,
+                borderRadius: 10,
+                padding: "8px 10px",
+                background: st.done ? C.track : "#fff",
+              }}
+            >
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <Btn
+                  variant={st.done ? "solid" : "ghost"}
+                  icon={<Check size={16} />}
+                  title={st.done ? "Mark not done" : "Mark done"}
+                  onClick={() => dispatch({ type: "toggleStep", taskId: task.id, stepId: st.id, t: Date.now() })}
+                />
+                <span style={{ flex: 1, minWidth: 0, overflowWrap: "anywhere", fontSize: 14, textDecoration: st.done ? "line-through" : "none", color: st.done ? C.muted : C.ink }}>
+                  {st.text}
+                </span>
+                {i === 0 && (
+                  <span style={{ background: C.blue, color: "#fff", borderRadius: 999, padding: "2px 9px", fontSize: 11, fontWeight: 600 }}>
+                    {p.complete ? "Used" : "Winner"}
+                  </span>
+                )}
+                <span style={{ fontSize: 12, color: C.muted }} title="Action score">{Math.round(stepScore(st))}</span>
+                <Btn variant="danger" icon={<Trash2 size={15} />} title="Delete action" onClick={() => dispatch({ type: "removeStep", taskId: task.id, stepId: st.id })} />
+              </div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {STEP_METRICS.map((m) => (
+                  <button
+                    key={m.key}
+                    type="button"
+                    title={`${m.label}. ${m.hint}. Tap to change.`}
+                    onClick={() => dispatch({ type: "rateStep", taskId: task.id, stepId: st.id, key: m.key, value: ((st[m.key] % 5) + 1) as Rating })}
+                    style={chipBtn}
+                  >
+                    {m.short} {st[m.key]}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
         </div>
       ))}
-      <div style={{ display: "grid", gap: 10, borderTop: `1px solid ${C.line}`, paddingTop: 10 }}>
+
+      <div style={{ display: "grid", gap: 10, borderTop: `1px solid ${C.line}`, paddingTop: 12 }}>
+        <div style={{ fontWeight: 600, fontSize: 14 }}>Add an option</div>
+        <div role="radiogroup" aria-label="Phase" style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6 }}>
+          {PHASES.map((ph) => {
+            const on = phase === ph.key;
+            return (
+              <button
+                key={ph.key}
+                type="button"
+                role="radio"
+                aria-checked={on}
+                onClick={() => setPhase(ph.key)}
+                style={{ ...chipBtn, minHeight: 40, borderRadius: 10, background: on ? C.blue : "#fff", color: on ? "#fff" : C.ink, borderColor: on ? C.blue : C.line }}
+              >
+                {ph.label}
+              </button>
+            );
+          })}
+        </div>
         <input
           value={text}
           onChange={(e) => setText(e.target.value)}
@@ -601,7 +666,7 @@ function StepEditor({ task, dispatch }: { task: Task; dispatch: Dispatch<Action>
               add();
             }
           }}
-          placeholder="A specific action for this task"
+          placeholder="A specific action for this phase"
           aria-label="New action"
           style={inputStyle}
         />
@@ -611,7 +676,7 @@ function StepEditor({ task, dispatch }: { task: Task; dispatch: Dispatch<Action>
           ))}
         </div>
         <div>
-          <Btn variant="solid" icon={<Plus size={16} />} onClick={add}>Add action</Btn>
+          <Btn variant="solid" icon={<Plus size={16} />} onClick={add}>Add option</Btn>
         </div>
       </div>
     </div>
@@ -884,9 +949,9 @@ export default function Page() {
   }
 
   const { focus, activeRow, advice } = d;
-  const focusSteps = focus ? focus.task.steps : [];
-  const pendingSteps = focusSteps.filter((x) => !x.done).sort((a, b) => stepScore(b) - stepScore(a));
-  const nextStep = pendingSteps[0] ?? null;
+  const focusPlan = focus ? phasePlan(focus.task) : [];
+  const currentPhase = focusPlan.find((x) => x.steps.length > 0 && !x.complete) ?? null;
+  const hasPlan = focusPlan.some((x) => x.steps.length > 0);
   const showAdvice = advice && advice.key !== dismissed;
   const pct = activeRow ? clamp((activeRow.activeMs / (activeRow.task.estMin * 60000)) * 100, 0, 100) : 0;
   const axis = [0, 0.25, 0.5, 0.75, 1].map((f) => now + f * d.horizon * 60000);
@@ -985,34 +1050,50 @@ export default function Page() {
                   ))}
                 </div>
 
-                <div style={{ background: "rgba(255,255,255,0.14)", borderRadius: 12, padding: "10px 12px", display: "grid", gap: 8 }}>
-                  {nextStep ? (
+                <div style={{ background: "rgba(255,255,255,0.14)", borderRadius: 12, padding: "8px", display: "grid", gap: 4 }}>
+                  {hasPlan ? (
                     <>
-                      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
-                        <div style={{ minWidth: 0 }}>
-                          <div style={{ fontSize: 13, opacity: 0.85 }}>
-                            Next action ({focusSteps.length - pendingSteps.length} of {focusSteps.length} done)
+                      {focusPlan.map((p) => {
+                        const w = p.winner;
+                        const isCur = currentPhase?.phase === p.phase;
+                        return (
+                          <div
+                            key={p.phase}
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 10,
+                              borderRadius: 8,
+                              padding: "6px 8px",
+                              background: isCur ? "rgba(255,255,255,0.22)" : "transparent",
+                              opacity: w ? 1 : 0.55,
+                            }}
+                          >
+                            <span style={{ width: 58, flexShrink: 0, fontSize: 13, fontWeight: 600 }}>{p.label}</span>
+                            <span style={{ flex: 1, minWidth: 0, overflowWrap: "anywhere", fontSize: 15, fontWeight: isCur ? 600 : 400, textDecoration: p.complete ? "line-through" : "none" }}>
+                              {w ? w.text : "No option yet"}
+                            </span>
+                            {p.complete && <Check size={16} />}
+                            {isCur && w && (
+                              <Btn
+                                variant="onBlue"
+                                icon={<Check size={18} />}
+                                title="Complete this action"
+                                onClick={() => dispatch({ type: "toggleStep", taskId: focus.task.id, stepId: w.id, t: Date.now() })}
+                              />
+                            )}
                           </div>
-                          <div style={{ fontWeight: 600, fontSize: 16, overflowWrap: "anywhere" }}>{nextStep.text}</div>
-                        </div>
-                        <Btn
-                          variant="onBlue"
-                          icon={<Check size={18} />}
-                          title="Complete this action"
-                          onClick={() => dispatch({ type: "toggleStep", taskId: focus.task.id, stepId: nextStep.id, t: Date.now() })}
-                        />
-                      </div>
-                      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                        {STEP_METRICS.map((m) => (
-                          <span key={m.key} title={`${m.label}. ${m.hint}`} style={{ background: "rgba(255,255,255,0.16)", borderRadius: 999, padding: "3px 10px", fontSize: 12, fontWeight: 500 }}>
-                            {m.short} {nextStep[m.key]}
-                          </span>
-                        ))}
+                        );
+                      })}
+                      <div style={{ fontSize: 12, opacity: 0.85, padding: "2px 8px" }}>
+                        {currentPhase
+                          ? `${currentPhase.label} winner, score ${Math.round(stepScore(currentPhase.winner as Step))}${currentPhase.steps.length > 1 ? `, beat ${currentPhase.steps.length - 1} other option${currentPhase.steps.length > 2 ? "s" : ""}` : ""}`
+                          : "Every phase is done. Finish the task."}
                       </div>
                     </>
                   ) : (
-                    <div style={{ fontSize: 14, opacity: 0.92 }}>
-                      {focusSteps.length ? "All actions are done. Finish the task." : "No actions yet. Open this task in the list below to add some."}
+                    <div style={{ fontSize: 14, opacity: 0.92, padding: "4px 8px" }}>
+                      No actions yet. Open this task in the list below and add options for Before, During and After. The best-scoring option in each phase becomes the plan.
                     </div>
                   )}
                 </div>
@@ -1172,7 +1253,7 @@ export default function Page() {
                           <div style={{ fontSize: 12, color: r.missed ? C.red : r.inWindow ? C.teal : C.muted, marginTop: 2 }}>
                             Score {Math.round(r.score)}, {r.task.estMin} min
                             {fmtWhen(r.task, now) ? `, ${fmtWhen(r.task, now)}` : ""}
-                            {r.task.steps.length ? `, ${r.task.steps.filter((x) => x.done).length}/${r.task.steps.length} actions` : ""}
+                            {planProgress(r.task)}
                           </div>
                         </button>
                         {isActive ? (
@@ -1243,7 +1324,7 @@ export default function Page() {
                           <div style={{ ...ellipsis, fontWeight: 600, fontSize: 15 }}>{t.title}</div>
                           <div style={{ fontSize: 12, color: C.teal, marginTop: 2 }}>
                             {fmtWhen(t, now)}
-                            {t.steps.length ? `, ${t.steps.filter((x) => x.done).length}/${t.steps.length} actions` : ""}
+                            {planProgress(t)}
                           </div>
                         </button>
                         <Btn icon={<Play size={18} />} title="Start early" onClick={() => act.start(t.id)} />
