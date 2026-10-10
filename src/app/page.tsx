@@ -11,7 +11,7 @@ type Prep = { id: string; name: string; min: number };
 type Win = { s: string; e: string };
 type Care = { id: string; label: string; icon: string; dur: number; slot: 'shower' | 'flex'; every?: number; days?: number[]; last?: string; note?: string };
 type Block = { id: string; label: string; start: number; dur: number; icon: string; kind: 'routine' | 'task' | 'prep' | 'sleep' | 'call'; note?: string; pri?: number; msg?: boolean; warn?: boolean };
-type Store = { sleep: string; wake: string; tasks: Task[]; preps: Prep[]; done: Record<string, boolean>; started: Record<string, number>; pris: Record<string, string[]>; care: Care[]; yuni: { usual: Win[]; today: Record<string, Win[]> }; call: Record<string, { start: number; len: number }>; seeded?: boolean };
+type Store = { sleep: string; wake: string; tasks: Task[]; preps: Prep[]; done: Record<string, boolean>; started: Record<string, number>; pris: Record<string, string[]>; care: Care[]; yuni: { usual: Win[]; today: Record<string, Win[]> }; call: Record<string, { start: number; len: number }>; seeded?: boolean; water: Record<string, number[]>; wGoal: number; wMl: number; wCut: number };
 
 const KEY = 'next-action-v1';
 // ---- easy-to-change config ----
@@ -25,7 +25,7 @@ const CARE: Care[] = [
 ];
 const CBLANK = { label: '', dur: 10, mode: 'every' as 'every' | 'days', every: 21, days: [] as number[], slot: 'shower' as 'shower' | 'flex', last: '' };
 const DL = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-const DEF: Store = { sleep: '21:00', wake: '05:00', tasks: [], preps: [{ id: 'h2s', name: 'Home to school', min: 90 }, { id: 's2h', name: 'School to home', min: 90 }, { id: 'w2s', name: 'Work to school', min: 60 }, { id: 's2w', name: 'School to work', min: 60 }], done: {}, started: {}, pris: {}, care: CARE, yuni: { usual: [], today: {} }, call: {}, seeded: true };
+const DEF: Store = { sleep: '21:00', wake: '05:00', tasks: [], preps: [{ id: 'h2s', name: 'Home to school', min: 90 }, { id: 's2h', name: 'School to home', min: 90 }, { id: 'w2s', name: 'Work to school', min: 60 }, { id: 's2w', name: 'School to work', min: 60 }], done: {}, started: {}, pris: {}, care: CARE, yuni: { usual: [], today: {} }, call: {}, seeded: true, water: {}, wGoal: 8, wMl: 250, wCut: 120 };
 const BLANK = { title: '', date: '', time: '', dur: 30, pri: 3, deadline: '', repeat: 'none' as Mode, days: [] as number[], prep: '', post: '' };
 const AM = [
   'Good morning, Yuni! I hope today feels light and kind.',
@@ -43,7 +43,7 @@ const PM = [
 const PC = ['#7c8aa5', '#6cb7d9', '#8fd0a4', '#f2c46d', '#ff8f7a'];
 const DAYS = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
 const IC: Record<string, LucideIcon> = { heart: Heart, water: Droplets, sun: Sun, target: Target, smile: Smile, sparkle: Sparkles, ban: Ban, brain: Brain, food: Utensils, bath: Bath, gym: Dumbbell, cardio: HeartPulse, task: Briefcase, prep: Footprints, sleep: BedDouble, cut: Scissors, call: Phone };
-const EV = 8; // evening routine minutes (teeth 3, face 2, moisturizer 2, goodnight 1)
+const EV = 13; // evening routine minutes (half bath 5, teeth 3, face 2, moisturizer 2, goodnight 1)
 
 const pad = (n: number) => String(n).padStart(2, '0');
 const ymd = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
@@ -168,12 +168,12 @@ function buildDay(s: Store, date: string, startAt: number) {
   }
 
   let t = sleepAt - EV;
-  for (const b of [R('teeth2', 'Brush teeth', 3, 'sparkle'), R('face2', 'Wash face', 2, 'smile'), R('moist2', 'Moisturize', 2, 'smile'), R('pm', 'Good night to Yuni', 1, 'heart', PM[h % PM.length], { msg: true })]) {
+  for (const b of [R('half', 'Half bath', 5, 'bath', 'Just the singit-singit part. Quick rinse, no soap on face.'), R('teeth2', 'Brush teeth', 3, 'sparkle'), R('face2', 'Wash face', 2, 'smile'), R('moist2', 'Moisturize', 2, 'smile'), R('pm', 'Good night to Yuni', 1, 'heart', PM[h % PM.length], { msg: true })]) {
     b.start = t; t += b.dur; placed.push(b);
   }
   const rest = toMin(s.wake) + 1440 - sleepAt;
   placed.push(R('sleep', 'Sleep', rest, 'sleep', `Lights out. ${(rest / 60).toFixed(1)} hours until ${fmt(toMin(s.wake))}.`, { start: sleepAt, kind: 'sleep' }));
-  return { blocks: placed.sort((a, b) => a.start - b.start), note, minimal, gaps, best };
+  return { blocks: placed.sort((a, b) => a.start - b.start), note, minimal, gaps, best, sleepAt };
 }
 
 const S: Record<string, CSSProperties> = {
@@ -282,6 +282,31 @@ export default function Page() {
   const yw = st.yuni.today[today] ?? st.yuni.usual;
   const free = plan.gaps.filter(([a, e]) => e - a >= CALL.min).map(([a, e]) => `${fmt(a)} to ${fmt(e)}`).join(', ');
   const ask = `Hi Yuni! Are you free for an uninterrupted call today? I can do ${free || 'later tonight'}. What time works for you?`;
+  const cancelCall = () => { // put the call back into the plan as a suggestion
+    const c = { ...st.call };
+    delete c[today];
+    up({ call: c, done: { ...st.done, [today + '|call']: false } });
+  };
+  // water: spread the daily glasses evenly from day start to (bedtime - cut-off)
+  const w0 = st.started[today] ?? toMin(st.wake);
+  const w1 = plan.sleepAt - st.wCut;
+  const wG = Math.max(1, st.wGoal);
+  const wl = st.water[today] ?? [];
+  const wStep = wG > 1 ? Math.max(0, w1 - w0) / (wG - 1) : 0;
+  const wExp = now >= w1 ? wG : now < w0 ? 0 : wStep > 0 ? Math.min(wG, Math.floor((now - w0) / wStep) + 1) : wG;
+  const wLeft = wG - wl.length;
+  const wBehind = Math.max(0, wExp - wl.length);
+  const wGap = wLeft > 0 && w1 > now ? Math.round((w1 - Math.max(now, w0)) / wLeft) : 0;
+  const wNext = w0 + wl.length * wStep;
+  const wMsg = wl.length >= wG
+    ? 'Goal reached. No need for more today.'
+    : now >= w1
+      ? `No more water before bed. The cut-off was ${fmt(w1)}.`
+      : wBehind > 0
+        ? `Drink one now, you are ${wBehind} behind. Spread the rest about every ${wGap} min until ${fmt(w1)}.`
+        : `On track. Next glass around ${fmt(Math.min(w1, wNext))}, the last one by ${fmt(w1)}.`;
+  const sip = () => up({ water: { ...st.water, [today]: [...wl, now] } });
+  const undoSip = () => up({ water: { ...st.water, [today]: wl.slice(0, -1) } });
   const startCall = (len: number) => up({ call: { ...st.call, [today]: { start: now, len } } });
   const addCare = () => {
     if (!cf.label.trim()) return;
@@ -364,9 +389,15 @@ export default function Page() {
                     <>
                       <p style={{ margin: '10px 0 14px', fontSize: 15 }}>{left > 0 ? `${left} min left. Phone on do not disturb. Nothing else is scheduled.` : 'Time is up. Wrap up warmly.'}</p>
                       <motion.button whileTap={{ scale: 0.96 }} style={S.btn} onClick={() => toggle('call')}><Check size={18} /> End call</motion.button>
+                      <Lab t="Move the start time" />
+                      <input type="time" style={S.inp} value={`${pad(Math.floor(ac.start / 60))}:${pad(ac.start % 60)}`} onChange={(e) => e.target.value && up({ call: { ...st.call, [today]: { ...ac, start: toMin(e.target.value) } } })} />
+                      <button onClick={cancelCall} style={{ ...S.chip, marginTop: 10 }}>Cancel and put it back in the plan</button>
                     </>
                   ) : isDone('call') ? (
-                    <p style={S.muted}>Call finished. Nice.</p>
+                    <>
+                      <p style={S.muted}>Call finished. Nice.</p>
+                      <button onClick={cancelCall} style={{ ...S.chip, marginTop: 10 }}>Undo and put it back in the plan</button>
+                    </>
                   ) : (
                     <>
                       <p style={S.muted}>Your free time, midday to night: {free || 'none yet'}</p>
@@ -378,6 +409,21 @@ export default function Page() {
                       <motion.button whileTap={{ scale: 0.96 }} style={S.btn} onClick={() => startCall(cl)}><Phone size={18} /> Start call now</motion.button>
                     </>
                   )}
+                </div>
+
+                <div style={S.card}>
+                  <b style={{ fontSize: 15 }}><Droplets size={15} style={{ verticalAlign: -2 }} /> Water</b>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, margin: '12px 0' }}>
+                    {Array.from({ length: Math.max(wG, wl.length) }, (_, i) => (
+                      <motion.div key={i} animate={{ backgroundColor: i < wl.length ? '#6cb7d9' : '#12151d' }} style={{ width: 22, height: 28, borderRadius: 6, border: `2px solid ${i < wExp ? '#6cb7d9' : '#2f3650'}` }} />
+                    ))}
+                  </div>
+                  <p style={{ margin: 0, fontSize: 15 }}>{wl.length} of {wG} glasses ({wl.length * st.wMl} ml). By now you should have {wExp}.</p>
+                  <p style={S.muted}>{wMsg}</p>
+                  <div style={{ ...S.row, marginTop: 12 }}>
+                    <motion.button whileTap={{ scale: 0.96 }} style={{ ...S.btn, flex: 1, width: 'auto' }} onClick={sip}><Droplets size={18} /> I drank a glass</motion.button>
+                    <button style={{ ...S.chip, padding: '0 14px' }} aria-label="Undo last glass" onClick={undoSip}>Undo</button>
+                  </div>
                 </div>
 
                 <div style={{ ...S.card, padding: 8 }}>
@@ -527,6 +573,16 @@ export default function Page() {
               <motion.button whileTap={{ scale: 0.97 }} style={{ ...S.btn, marginTop: 14 }} onClick={addCare}><Plus size={18} /> Add care item</motion.button>
             </div>
 
+            <div style={S.card}>
+              <b style={{ fontSize: 15 }}>Water</b>
+              <p style={S.muted}>Glasses are spread evenly from your day start until the cut-off before bed.</p>
+              <div style={S.row}>
+                <div style={{ flex: 1 }}><Lab t="Glasses per day" /><input type="number" min={1} style={S.inp} value={st.wGoal} onChange={(e) => up({ wGoal: +e.target.value || 0 })} /></div>
+                <div style={{ flex: 1 }}><Lab t="ml per glass" /><input type="number" min={1} style={S.inp} value={st.wMl} onChange={(e) => up({ wMl: +e.target.value || 0 })} /></div>
+                <div style={{ flex: 1 }}><Lab t="No water before bed (min)" /><input type="number" min={0} style={S.inp} value={st.wCut} onChange={(e) => up({ wCut: +e.target.value || 0 })} /></div>
+              </div>
+            </div>
+
             <button style={{ ...S.chip, width: '100%', padding: 12 }} onClick={resetToday}>Reset today and show Start my day again</button>
           </>
         )}
@@ -534,4 +590,3 @@ export default function Page() {
     </div>
   );
 }
-
