@@ -6,12 +6,12 @@ import type { LucideIcon } from 'lucide-react';
 import { Ban, Bath, BedDouble, Brain, Briefcase, Check, Clock, Copy, Droplets, Dumbbell, Footprints, Heart, HeartPulse, ListTodo, Moon, Phone, Play, Plus, Scissors, Settings, Smile, Sparkles, Sun, Target, Trash2, Utensils } from 'lucide-react';
 
 type Mode = 'none' | 'daily' | 'weekly';
-type Task = { id: string; title: string; date: string; time: string; dur: number; pri: number; deadline: string; repeat: Mode; days: number[]; prep: string };
+type Task = { id: string; title: string; date: string; time: string; dur: number; pri: number; deadline: string; repeat: Mode; days: number[]; prep: string; post?: string };
 type Prep = { id: string; name: string; min: number };
 type Win = { s: string; e: string };
 type Care = { id: string; label: string; icon: string; dur: number; slot: 'shower' | 'flex'; every?: number; days?: number[]; last?: string; note?: string };
 type Block = { id: string; label: string; start: number; dur: number; icon: string; kind: 'routine' | 'task' | 'prep' | 'sleep' | 'call'; note?: string; pri?: number; msg?: boolean; warn?: boolean };
-type Store = { sleep: string; wake: string; tasks: Task[]; preps: Prep[]; done: Record<string, boolean>; started: Record<string, number>; pris: Record<string, string[]>; care: Care[]; yuni: { usual: Win[]; today: Record<string, Win[]> }; call: Record<string, { start: number; len: number }> };
+type Store = { sleep: string; wake: string; tasks: Task[]; preps: Prep[]; done: Record<string, boolean>; started: Record<string, number>; pris: Record<string, string[]>; care: Care[]; yuni: { usual: Win[]; today: Record<string, Win[]> }; call: Record<string, { start: number; len: number }>; seeded?: boolean };
 
 const KEY = 'next-action-v1';
 // ---- easy-to-change config ----
@@ -25,8 +25,8 @@ const CARE: Care[] = [
 ];
 const CBLANK = { label: '', dur: 10, mode: 'every' as 'every' | 'days', every: 21, days: [] as number[], slot: 'shower' as 'shower' | 'flex', last: '' };
 const DL = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-const DEF: Store = { sleep: '21:00', wake: '05:00', tasks: [], preps: [{ id: 'school', name: 'Going to school', min: 90 }], done: {}, started: {}, pris: {}, care: CARE, yuni: { usual: [], today: {} }, call: {} };
-const BLANK = { title: '', date: '', time: '', dur: 30, pri: 3, deadline: '', repeat: 'none' as Mode, days: [] as number[], prep: '' };
+const DEF: Store = { sleep: '21:00', wake: '05:00', tasks: [], preps: [{ id: 'h2s', name: 'Home to school', min: 90 }, { id: 's2h', name: 'School to home', min: 90 }, { id: 'w2s', name: 'Work to school', min: 60 }, { id: 's2w', name: 'School to work', min: 60 }], done: {}, started: {}, pris: {}, care: CARE, yuni: { usual: [], today: {} }, call: {}, seeded: true };
+const BLANK = { title: '', date: '', time: '', dur: 30, pri: 3, deadline: '', repeat: 'none' as Mode, days: [] as number[], prep: '', post: '' };
 const AM = [
   'Good morning, Yuni! I hope today feels light and kind.',
   'Rise and shine, Yuni. Today is going to be a good one.',
@@ -84,6 +84,8 @@ function buildDay(s: Store, date: string, startAt: number) {
     const p = s.preps.find((x) => x.id === t.prep);
     if (p) placed.push(R('p:' + t.id, p.name + ' prep', p.min, 'prep', 'Auto prep for ' + t.title, { start: st - p.min, kind: 'prep' }));
     placed.push(R('t:' + t.id, t.title, t.dur, 'task', info(t), { start: st, kind: 'task', pri: t.pri }));
+    const q = s.preps.find((x) => x.id === t.post); // travel back / wrap-up after the task
+    if (q) placed.push(R('q:' + t.id, q.name, q.min, 'prep', 'After ' + t.title, { start: st + t.dur, kind: 'prep' }));
   }
   const fixed = [...placed];
   const minimal = fixed.length > 0 && Math.min(...fixed.map((b) => b.start)) < startAt + 162;
@@ -223,7 +225,14 @@ export default function Page() {
   const [cf, setCf] = useState(CBLANK);
 
   useEffect(() => {
-    try { const r = localStorage.getItem(KEY); if (r) setSt({ ...DEF, ...JSON.parse(r) }); } catch { /* ignore */ }
+    try { const r = localStorage.getItem(KEY); if (r) {
+        const s: Store = { ...DEF, ...JSON.parse(r) };
+        if (!s.seeded) { // one-time: add the default travel presets to older saved data
+          s.preps = [...s.preps, ...DEF.preps.filter((d) => !s.preps.some((x) => x.id === d.id))];
+          s.seeded = true;
+        }
+        setSt(s);
+      } } catch { /* ignore */ }
     const tick = () => { const d = new Date(); setToday(ymd(d)); setNow(d.getHours() * 60 + d.getMinutes()); };
     tick();
     setReady(true);
@@ -417,9 +426,14 @@ export default function Page() {
                   {DAYS.map((d, i) => <Chip key={i} on={f.days.includes(i)} onClick={() => setF({ ...f, days: f.days.includes(i) ? f.days.filter((x) => x !== i) : [...f.days, i] })}>{d}</Chip>)}
                 </div>
               )}
-              <Lab t="Automatic prep (set once in Settings)" />
+              <Lab t="Prep or travel before (set once in Settings)" />
               <select style={S.inp} value={f.prep} onChange={(e) => setF({ ...f, prep: e.target.value })}>
                 <option value="">No prep</option>
+                {st.preps.map((p) => <option key={p.id} value={p.id}>{p.name} ({p.min} min)</option>)}
+              </select>
+              <Lab t="Travel or wrap-up after" />
+              <select style={S.inp} value={f.post ?? ''} onChange={(e) => setF({ ...f, post: e.target.value })}>
+                <option value="">Nothing after</option>
                 {st.preps.map((p) => <option key={p.id} value={p.id}>{p.name} ({p.min} min)</option>)}
               </select>
               <motion.button whileTap={{ scale: 0.97 }} style={{ ...S.btn, marginTop: 16 }} onClick={addTask}><Plus size={18} /> Add task</motion.button>
@@ -435,7 +449,7 @@ export default function Page() {
                       {t.time ? fmt(toMin(t.time)) : 'Flexible'}, {t.dur} min, priority {t.pri}
                       {t.repeat === 'daily' ? ', every day' : t.repeat === 'weekly' ? ', every ' + t.days.map((d) => DAYS[d]).join('') : ', ' + t.date}
                       {t.deadline ? ', due ' + t.deadline : ''}
-                      {st.preps.find((p) => p.id === t.prep) ? ', prep ' + st.preps.find((p) => p.id === t.prep)?.min + ' min' : ''}
+                      {st.preps.find((p) => p.id === t.prep) ? ', before: ' + st.preps.find((p) => p.id === t.prep)?.name : ''}{st.preps.find((p) => p.id === t.post) ? ', after: ' + st.preps.find((p) => p.id === t.post)?.name : ''}
                     </div>
                   </div>
                   <button aria-label="Delete task" onClick={() => up({ tasks: st.tasks.filter((x) => x.id !== t.id) })} style={{ ...S.chip, padding: 8 }}><Trash2 size={16} /></button>
@@ -457,11 +471,12 @@ export default function Page() {
             </div>
 
             <div style={S.card}>
-              <b style={{ fontSize: 15 }}>Prep presets</b>
-              <p style={S.muted}>Set once, then attach to any task. The prep block is placed before it automatically.</p>
+              <b style={{ fontSize: 15 }}>Prep and travel presets</b>
+              <p style={S.muted}>Set once, then attach to any task as before (prep, travel there) or after (travel back, wrap-up). Both are placed automatically around the task time.</p>
               {st.preps.map((p) => (
                 <div key={p.id} style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 10 }}>
-                  <div style={{ flex: 1 }}>{p.name}, {p.min} min</div>
+                  <div style={{ flex: 1 }}>{p.name}</div>
+                  <input type="number" min={1} aria-label="Minutes" style={{ ...S.inp, width: 76 }} value={p.min} onChange={(e) => up({ preps: st.preps.map((x) => (x.id === p.id ? { ...x, min: Math.max(1, +e.target.value || 0) } : x)) })} />
                   <button aria-label="Delete preset" onClick={() => up({ preps: st.preps.filter((x) => x.id !== p.id) })} style={{ ...S.chip, padding: 8 }}><Trash2 size={16} /></button>
                 </div>
               ))}
@@ -519,3 +534,4 @@ export default function Page() {
     </div>
   );
 }
+
