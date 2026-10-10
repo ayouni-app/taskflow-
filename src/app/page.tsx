@@ -1,1515 +1,521 @@
-"use client";
+'use client';
+import { useEffect, useMemo, useState } from 'react';
+import type { CSSProperties, ReactNode } from 'react';
+import { AnimatePresence, motion } from 'framer-motion';
+import type { LucideIcon } from 'lucide-react';
+import { Ban, Bath, BedDouble, Brain, Briefcase, Check, Clock, Copy, Droplets, Dumbbell, Footprints, Heart, HeartPulse, ListTodo, Moon, Phone, Play, Plus, Scissors, Settings, Smile, Sparkles, Sun, Target, Trash2, Utensils } from 'lucide-react';
 
-/**
- * Top 1 - one-page priority engine (Next.js App Router: app/page.tsx)
- * Deps: framer-motion, lucide-react.  Styling: inline CSS only.
- *
- * Method implemented:
- *  1. Timeline        -> planned schedule from "now" with due markers
- *  2. Priority tasks  -> estimate, optional fixed start/end, and ranked actions
- *  3. Rank at now     -> importance, urgency (raised automatically by deadlines),
- *                        consequence of neglect, opportunity
- *  4. Execute leader  -> one active task; interrupt only when switching/stopping wins
- *  5. Metrics         -> valuable output, waiting time, context switches
- *
- * Persistence: localStorage, every session / wait / event is timestamped (epoch ms),
- * so timers survive reloads and sleeping tabs.
- */
+type Mode = 'none' | 'daily' | 'weekly';
+type Task = { id: string; title: string; date: string; time: string; dur: number; pri: number; deadline: string; repeat: Mode; days: number[]; prep: string };
+type Prep = { id: string; name: string; min: number };
+type Win = { s: string; e: string };
+type Care = { id: string; label: string; icon: string; dur: number; slot: 'shower' | 'flex'; every?: number; days?: number[]; last?: string; note?: string };
+type Block = { id: string; label: string; start: number; dur: number; icon: string; kind: 'routine' | 'task' | 'prep' | 'sleep' | 'call'; note?: string; pri?: number; msg?: boolean; warn?: boolean };
+type Store = { sleep: string; wake: string; tasks: Task[]; preps: Prep[]; done: Record<string, boolean>; started: Record<string, number>; pris: Record<string, string[]>; care: Care[]; yuni: { usual: Win[]; today: Record<string, Win[]> }; call: Record<string, { start: number; len: number }> };
 
-import { useEffect, useMemo, useReducer, useRef, useState } from "react";
-import type { CSSProperties, Dispatch, FormEvent, ReactNode } from "react";
-import { AnimatePresence, MotionConfig, motion } from "framer-motion";
-import {
-  AlertTriangle,
-  ArrowRightLeft,
-  CalendarClock,
-  Check,
-  ChevronDown,
-  Download,
-  Hourglass,
-  Pause,
-  Play,
-  Plus,
-  RotateCcw,
-  Trash2,
-  Undo2,
-} from "lucide-react";
-
-/* ----------------------------- types ----------------------------- */
-
-type Rating = 1 | 2 | 3 | 4 | 5;
-type RateKey = "importance" | "urgency" | "consequence" | "opportunity";
-type Status = "todo" | "waiting" | "done";
-
-type Phase = "before" | "during" | "after";
-type StepKey = "quality" | "probability" | "effort";
-interface Step {
-  id: string;
-  text: string;
-  phase: Phase; // when in the task this action happens
-  quality: Rating; // results expected quality: higher is better
-  probability: Rating; // probability of success: higher is better
-  effort: Rating; // cognitive effort required: lower is better
-  done: boolean;
-  doneAt: number | null;
-}
-interface Task {
-  id: string;
-  title: string;
-  importance: Rating;
-  urgency: Rating;
-  consequence: Rating;
-  opportunity: Rating;
-  estMin: number;
-  startAt: number | null; // fixed start: unavailable before this time
-  endAt: number | null; // fixed end: window closes (acts as the deadline)
-  steps: Step[];
-  createdAt: number;
-  status: Status;
-  doneAt: number | null;
-}
-interface Span {
-  id: string;
-  taskId: string;
-  start: number;
-  end: number | null;
-}
-type LogType = "add" | "start" | "switch" | "pause" | "wait" | "unblock" | "done" | "reopen" | "remove" | "step";
-interface LogEntry {
-  id: string;
-  t: number;
-  type: LogType;
-  taskId: string;
-  title: string;
-  note?: string;
-}
-interface State {
-  tasks: Task[];
-  sessions: Span[]; // focus time (end === null -> running)
-  waits: Span[]; // blocked time (end === null -> still waiting)
-  log: LogEntry[];
-}
-interface Row {
-  task: Task;
-  activeMs: number;
-  score: number;
-  urgency: number;
-  raisedByDeadline: boolean;
-  inWindow: boolean;
-  missed: boolean;
-}
-interface Advice {
-  kind: "switch" | "overrun" | "fixed";
-  key: string;
-  text: string;
-  target?: Row;
-}
-
-/* ----------------------------- constants ----------------------------- */
-
-const KEY = "top1:v1";
-const SWITCH_MARGIN = 12; // a rival must beat the active task by this many points
-const EMPTY: State = { tasks: [], sessions: [], waits: [], log: [] };
-const WINDOW_BONUS = 20; // a task whose fixed window is open outranks free-floating work
-const HEADS_UP_MIN = 10; // warn this many minutes before a fixed task starts
-
-const STEP_METRICS: { key: StepKey; label: string; short: string; hint: string }[] = [
-  { key: "quality", label: "Results expected quality", short: "Quality", hint: "Higher is better" },
-  { key: "probability", label: "Probability of success", short: "Success", hint: "Higher is better" },
-  { key: "effort", label: "Cognitive effort required", short: "Effort", hint: "Lower is better" },
+const KEY = 'next-action-v1';
+// ---- easy-to-change config ----
+const CALL = { min: 30, max: 60, from: 720 }; // call window starts at midday (minutes)
+const SHOWER: [string, number[]][] = [['shampoo', [1, 5]], ['conditioner', [1, 3, 5]], ['scrub', [5]]]; // product, weekdays (0 = Sunday)
+const CARE: Care[] = [
+  { id: 'shave', label: 'Shave', icon: 'cut', dur: 10, days: [1], slot: 'shower' },
+  { id: 'fnail', label: 'Cut fingernails', icon: 'cut', dur: 10, every: 21, slot: 'shower' },
+  { id: 'tnail', label: 'Cut toenails', icon: 'cut', dur: 10, every: 28, slot: 'shower' },
+  { id: 'hair', label: 'Haircut trim', icon: 'cut', dur: 30, every: 40, slot: 'flex' },
 ];
-/** Best next action = high quality, high success odds, low effort (effort is inverted). */
-const stepScore = (st: Step) =>
-  ((st.quality * 0.4 + st.probability * 0.35 + (6 - st.effort) * 0.25) / 5) * 100;
-
-const PHASES: { key: Phase; label: string; hint: string }[] = [
-  { key: "before", label: "Before", hint: "Set up: what makes the work possible" },
-  { key: "during", label: "During", hint: "Do the work itself" },
-  { key: "after", label: "After", hint: "Close out: verify, hand off, follow up" },
+const CBLANK = { label: '', dur: 10, mode: 'every' as 'every' | 'days', every: 21, days: [] as number[], slot: 'shower' as 'shower' | 'flex', last: '' };
+const DL = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const DEF: Store = { sleep: '21:00', wake: '05:00', tasks: [], preps: [{ id: 'school', name: 'Going to school', min: 90 }], done: {}, started: {}, pris: {}, care: CARE, yuni: { usual: [], today: {} }, call: {} };
+const BLANK = { title: '', date: '', time: '', dur: 30, pri: 3, deadline: '', repeat: 'none' as Mode, days: [] as number[], prep: '' };
+const AM = [
+  'Good morning, Yuni! I hope today feels light and kind.',
+  'Rise and shine, Yuni. Today is going to be a good one.',
+  'Morning, Yuni! Sending you a big hug and a strong start.',
+  'Good morning, Yuni. Go get some sunshine today!',
+  'Hi Yuni, good morning! Proud of you already.',
 ];
-/**
- * Per phase, the options compete: the highest-scoring action wins and is the way the
- * task gets done. Doing any option completes the phase (that one is then "used").
- * Current phase = first phase that has options and is not complete.
- */
-function phasePlan(task: Task) {
-  return PHASES.map((ph) => {
-    const steps = task.steps
-      .filter((x) => x.phase === ph.key)
-      .sort((a, b) => Number(b.done) - Number(a.done) || stepScore(b) - stepScore(a));
-    const winner: Step | null = steps[0] ?? null;
-    return { phase: ph.key, label: ph.label, steps, winner, complete: winner?.done ?? false };
-  });
-}
-const planProgress = (t: Task) => {
-  const active = phasePlan(t).filter((x) => x.steps.length > 0);
-  return active.length ? `, ${active.filter((x) => x.complete).length}/${active.length} phases done` : "";
-};
-
-const C = {
-  bg: "#E8ECF3",
-  surface: "#F8F9FC",
-  ink: "#101A2C",
-  muted: "#5B6679",
-  line: "#CBD3E1",
-  track: "#EAEEF6",
-  blue: "#2447D6",
-  blueSoft: "#8CA0E8",
-  amber: "#B7791F",
-  red: "#C0293B",
-  green: "#26805A",
-  teal: "#0E7C86",
-};
-const HEAD = `"Bricolage Grotesque", "Segoe UI", system-ui, sans-serif`;
-const BODY = `"Instrument Sans", "Segoe UI", system-ui, sans-serif`;
-
-const RATINGS: { key: RateKey; label: string; hint: string }[] = [
-  { key: "importance", label: "Importance", hint: "Value if it gets done" },
-  { key: "urgency", label: "Urgency", hint: "How soon it matters" },
-  { key: "consequence", label: "Consequence of neglect", hint: "Cost of leaving it" },
-  { key: "opportunity", label: "Opportunity", hint: "Upside that may expire" },
+const PM = [
+  'Good night, Yuni. Sleep well and dream sweet.',
+  'Sweet dreams, Yuni. See you tomorrow.',
+  'Night night, Yuni. You did great today, rest well.',
+  'Good night, Yuni! Sending you warm hugs.',
 ];
+const PC = ['#7c8aa5', '#6cb7d9', '#8fd0a4', '#f2c46d', '#ff8f7a'];
+const DAYS = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
+const IC: Record<string, LucideIcon> = { heart: Heart, water: Droplets, sun: Sun, target: Target, smile: Smile, sparkle: Sparkles, ban: Ban, brain: Brain, food: Utensils, bath: Bath, gym: Dumbbell, cardio: HeartPulse, task: Briefcase, prep: Footprints, sleep: BedDouble, cut: Scissors, call: Phone };
+const EV = 8; // evening routine minutes (teeth 3, face 2, moisturizer 2, goodnight 1)
 
-/* ----------------------------- helpers ----------------------------- */
+const pad = (n: number) => String(n).padStart(2, '0');
+const ymd = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const toMin = (s: string) => { const [h, m] = s.split(':').map(Number); return h * 60 + m; };
+const fmt = (m: number) => { const x = ((Math.round(m) % 1440) + 1440) % 1440; const h = Math.floor(x / 60); return `${h % 12 || 12}:${pad(x % 60)} ${h < 12 ? 'am' : 'pm'}`; };
+const hash = (s: string) => Math.abs(s.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 7));
+const uid = () => Math.random().toString(36).slice(2, 9);
+const dowOf = (d: string) => new Date(d + 'T00:00').getDay();
+const info = (t: Task) => `Priority ${t.pri}, ${t.dur} min${t.deadline ? ', due ' + t.deadline : ''}`;
 
-const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(36);
-const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
-const pad = (n: number) => String(n).padStart(2, "0");
-const startOfDay = (t: number) => {
-  const d = new Date(t);
-  d.setHours(0, 0, 0, 0);
-  return d.getTime();
-};
+const dayN = (d: string) => Math.round(new Date(d + 'T00:00').getTime() / 864e5);
+// weekday items repeat on those weekdays; "every N days" items count from the last time they were checked off
+function careDue(c: Care, date: string, done: Record<string, boolean>) {
+  if (c.days) return c.days.includes(dowOf(date));
+  if (!c.every) return false;
+  const prev = Object.keys(done).filter((k) => done[k] && k.endsWith('|c:' + c.id) && k.slice(0, 10) < date).map((k) => k.slice(0, 10));
+  const last = [c.last || '', ...prev].sort().pop() || '';
+  return !last || dayN(date) - dayN(last) >= c.every;
+}
 
-const fmtTimer = (ms: number) => {
-  const s = Math.max(0, Math.floor(ms / 1000));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  return h > 0 ? `${h}:${pad(m)}:${pad(s % 60)}` : `${pad(m)}:${pad(s % 60)}`;
-};
-const fmtDur = (ms: number) => {
-  const m = Math.max(0, Math.round(ms / 60000));
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  return m % 60 ? `${h}h ${m % 60}m` : `${h}h`;
-};
-const fmtClock = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-const fmtDay = (ms: number, now: number) => {
-  const diff = Math.round((startOfDay(ms) - startOfDay(now)) / 86400000);
-  if (diff === 0) return "today";
-  if (diff === 1) return "tomorrow";
-  return new Date(ms).toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
-};
-const fmtDue = (due: number, now: number) =>
-  due < now ? `Overdue by ${fmtDur(now - due)}` : `Due ${fmtDay(due, now)} ${fmtClock(due)}`;
-const fmtWhen = (t: Task, now: number) => {
-  const { startAt, endAt } = t;
-  if (endAt !== null && now >= endAt) return `Ended ${fmtDur(now - endAt)} ago`;
-  if (startAt !== null && now < startAt) {
-    return `Starts ${fmtDay(startAt, now)} ${fmtClock(startAt)}${endAt !== null ? `, ends ${fmtClock(endAt)}` : ""}`;
+function occurs(t: Task, date: string, done: Record<string, boolean>) {
+  if (t.repeat === 'daily') return date >= t.date;
+  if (t.repeat === 'weekly') return date >= t.date && t.days.includes(dowOf(date));
+  if (t.time) return t.date === date;
+  return t.date <= date && !Object.keys(done).some((k) => k.endsWith('|t:' + t.id) && !k.startsWith(date));
+}
+
+function buildDay(s: Store, date: string, startAt: number) {
+  const dow = dowOf(date);
+  const h = hash(date);
+  const R = (id: string, label: string, dur: number, icon: string, note?: string, x: Partial<Block> = {}): Block => ({ id, label, dur, icon, note, start: 0, kind: 'routine', ...x });
+  const todays = s.tasks.filter((t) => occurs(t, date, s.done));
+  const placed: Block[] = [];
+
+  // fixed-time tasks and their automatic prep
+  for (const t of todays.filter((t) => t.time)) {
+    const st = toMin(t.time);
+    const p = s.preps.find((x) => x.id === t.prep);
+    if (p) placed.push(R('p:' + t.id, p.name + ' prep', p.min, 'prep', 'Auto prep for ' + t.title, { start: st - p.min, kind: 'prep' }));
+    placed.push(R('t:' + t.id, t.title, t.dur, 'task', info(t), { start: st, kind: 'task', pri: t.pri }));
   }
-  if (startAt !== null) {
-    return endAt !== null ? `Window open, ends ${fmtClock(endAt)} (in ${fmtDur(endAt - now)})` : `Started ${fmtClock(startAt)}`;
+  const fixed = [...placed];
+  const minimal = fixed.length > 0 && Math.min(...fixed.map((b) => b.start)) < startAt + 162;
+  const ac = s.call[date]; // a call already started is a fixed block nothing else can overlap
+  if (ac) {
+    const cb2 = R('call', 'Call with Yuni', ac.len, 'call', 'Uninterrupted. Phone on do not disturb.', { start: ac.start, kind: 'call' });
+    placed.push(cb2);
+    fixed.push(cb2);
   }
-  return endAt !== null ? fmtDue(endAt, now) : "";
-};
 
-const overlap = (spans: Span[], now: number, from: number, taskId?: string) =>
-  spans.reduce((acc, s) => {
-    if (taskId && s.taskId !== taskId) return acc;
-    return acc + Math.max(0, (s.end ?? now) - Math.max(s.start, from));
-  }, 0);
+  const parts = SHOWER.filter(([, d]) => d.includes(dow)).map(([n]) => n);
+  const shower = R('shower', 'Take a shower', 15, 'bath', `Fast. Prioritize singit-singit, no soap on face. Today: ${parts.length ? parts.join(' + ') : 'just rinse'}.`);
+  const eat = R('eat', 'Eat high protein, whole food', 30, 'food');
+  const dueCare = s.care.filter((c) => careDue(c, date, s.done));
+  const cb = (c: Care) => R('c:' + c.id, c.label, c.dur, c.icon, c.note);
+  const inFlow = minimal ? [] : dueCare.filter((c) => c.slot === 'shower').map(cb);
+  const later = dueCare.filter((c) => minimal || c.slot !== 'shower').map(cb);
+  const start = [
+    R('am', 'Good morning to Yuni', 2, 'heart', AM[h % AM.length], { msg: true }),
+    R('water', 'Drink water', 2, 'water', 'A full glass first.'),
+    R('sun', 'Walk to the sunlight', 10, 'sun', 'No phone. Just light and air.'),
+    R('pri', 'Set your 3 priorities', 5, 'target', 'Write the 3 that matter most today.'),
+  ];
+  const skin = [R('teeth', 'Brush teeth', 3, 'sparkle'), R('face', 'Wash face', 2, 'smile'), R('moist', 'Moisturize', 1, 'smile'), R('spf', 'Apply sunscreen', 1, 'sun')];
+  const flow = minimal
+    ? [...start, eat, shower, ...skin]
+    : [...start, ...skin, R('noent', 'No entertainment for now', 1, 'ban', 'Not yet. Deep work comes first.'), R('deep', 'Deep work', 90, 'brain', 'Phone away. One thing only.'), eat, shower, ...inFlow];
 
-/** Urgency is the higher of what you set and what the end time demands right now. */
-function scoreTask(task: Task, activeMs: number, now: number): Row {
-  let derived = 1;
-  if (task.endAt !== null) {
-    const remaining = Math.max(5, task.estMin - activeMs / 60000) * 60000;
-    const slackH = (task.endAt - now - remaining) / 3600000;
-    derived = slackH <= 0 ? 5 : slackH < 1 ? 4.5 : slackH < 4 ? 4 : slackH < 24 ? 3 : slackH < 72 ? 2 : 1;
-  }
-  const inWindow = task.startAt !== null && now >= task.startAt && (task.endAt === null || now < task.endAt);
-  const missed = task.endAt !== null && now >= task.endAt;
-  const urgency = Math.max(task.urgency, derived);
-  const base = ((task.importance * 0.3 + urgency * 0.3 + task.consequence * 0.25 + task.opportunity * 0.15) / 5) * 100;
-  const score = base + (inWindow ? WINDOW_BONUS : 0);
-  return { task, activeMs, score, urgency, raisedByDeadline: derived > task.urgency, inWindow, missed };
-}
-const byRank = (a: Row, b: Row) =>
-  b.score - a.score ||
-  (a.task.endAt ?? 9e15) - (b.task.endAt ?? 9e15) ||
-  a.task.createdAt - b.task.createdAt;
-
-/* ----------------------------- state ----------------------------- */
-
-type Action =
-  | { type: "hydrate"; state: State }
-  | { type: "add"; task: Task }
-  | { type: "start"; id: string; t: number }
-  | { type: "pause"; t: number }
-  | { type: "wait"; id: string; t: number }
-  | { type: "unblock"; id: string; t: number }
-  | { type: "done"; id: string; t: number }
-  | { type: "reopen"; id: string; t: number }
-  | { type: "remove"; id: string; t: number }
-  | { type: "rate"; id: string; key: RateKey; value: Rating }
-  | { type: "addStep"; taskId: string; step: Step }
-  | { type: "toggleStep"; taskId: string; stepId: string; t: number }
-  | { type: "rateStep"; taskId: string; stepId: string; key: StepKey; value: Rating }
-  | { type: "removeStep"; taskId: string; stepId: string }
-  | { type: "reset" };
-
-const closeSpans = (spans: Span[], t: number, taskId?: string): Span[] =>
-  spans.map((s) => (s.end === null && (!taskId || s.taskId === taskId) ? { ...s, end: t } : s));
-const entry = (t: number, type: LogType, task: Task, note?: string): LogEntry => ({
-  id: uid(),
-  t,
-  type,
-  taskId: task.id,
-  title: task.title,
-  note,
-});
-const withLog = (s: State, e: LogEntry): LogEntry[] => [...s.log, e].slice(-400);
-const setStatus = (tasks: Task[], id: string, patch: Partial<Task>) =>
-  tasks.map((x) => (x.id === id ? { ...x, ...patch } : x));
-
-function reducer(s: State, a: Action): State {
-  switch (a.type) {
-    case "hydrate":
-      return a.state;
-    case "reset":
-      return EMPTY;
-    case "add":
-      return { ...s, tasks: [...s.tasks, a.task], log: withLog(s, entry(a.task.createdAt, "add", a.task)) };
-    case "rate":
-      return {
-        ...s,
-        tasks: s.tasks.map((x) => {
-          if (x.id !== a.id) return x;
-          const next: Task = { ...x };
-          next[a.key] = a.value;
-          return next;
-        }),
-      };
-    case "addStep": {
-      const task = s.tasks.find((x) => x.id === a.taskId);
-      if (!task) return s;
-      return { ...s, tasks: setStatus(s.tasks, a.taskId, { steps: [...task.steps, a.step] }) };
-    }
-    case "toggleStep": {
-      const task = s.tasks.find((x) => x.id === a.taskId);
-      const st = task?.steps.find((x) => x.id === a.stepId);
-      if (!task || !st) return s;
-      const nowDone = !st.done;
-      const steps = task.steps.map((x) => (x.id === a.stepId ? { ...x, done: nowDone, doneAt: nowDone ? a.t : null } : x));
-      return {
-        ...s,
-        tasks: setStatus(s.tasks, a.taskId, { steps }),
-        log: nowDone ? withLog(s, entry(a.t, "step", task, `${st.phase}: ${st.text}`)) : s.log,
-      };
-    }
-    case "rateStep": {
-      const task = s.tasks.find((x) => x.id === a.taskId);
-      if (!task) return s;
-      const steps = task.steps.map((x) => {
-        if (x.id !== a.stepId) return x;
-        const next: Step = { ...x };
-        next[a.key] = a.value;
-        return next;
-      });
-      return { ...s, tasks: setStatus(s.tasks, a.taskId, { steps }) };
-    }
-    case "removeStep": {
-      const task = s.tasks.find((x) => x.id === a.taskId);
-      if (!task) return s;
-      return { ...s, tasks: setStatus(s.tasks, a.taskId, { steps: task.steps.filter((x) => x.id !== a.stepId) }) };
-    }
-    case "start": {
-      const task = s.tasks.find((x) => x.id === a.id);
-      if (!task || task.status === "done") return s;
-      const open = s.sessions.find((x) => x.end === null);
-      if (open?.taskId === a.id) return s;
-      const from = open ? s.tasks.find((x) => x.id === open.taskId) : undefined;
-      const e = open
-        ? entry(a.t, "switch", task, from ? `left \u201C${from.title}\u201D` : undefined)
-        : entry(a.t, "start", task);
-      return {
-        tasks: setStatus(s.tasks, a.id, { status: "todo" }),
-        sessions: [...closeSpans(s.sessions, a.t), { id: uid(), taskId: a.id, start: a.t, end: null }],
-        waits: task.status === "waiting" ? closeSpans(s.waits, a.t, a.id) : s.waits,
-        log: withLog(s, e),
-      };
-    }
-    case "pause": {
-      const open = s.sessions.find((x) => x.end === null);
-      const task = open && s.tasks.find((x) => x.id === open.taskId);
-      if (!open || !task) return s;
-      return { ...s, sessions: closeSpans(s.sessions, a.t), log: withLog(s, entry(a.t, "pause", task)) };
-    }
-    case "wait": {
-      const task = s.tasks.find((x) => x.id === a.id);
-      if (!task || task.status !== "todo") return s;
-      return {
-        tasks: setStatus(s.tasks, a.id, { status: "waiting" }),
-        sessions: closeSpans(s.sessions, a.t, a.id),
-        waits: [...s.waits, { id: uid(), taskId: a.id, start: a.t, end: null }],
-        log: withLog(s, entry(a.t, "wait", task)),
-      };
-    }
-    case "unblock": {
-      const task = s.tasks.find((x) => x.id === a.id);
-      if (!task || task.status !== "waiting") return s;
-      return {
-        ...s,
-        tasks: setStatus(s.tasks, a.id, { status: "todo" }),
-        waits: closeSpans(s.waits, a.t, a.id),
-        log: withLog(s, entry(a.t, "unblock", task)),
-      };
-    }
-    case "done": {
-      const task = s.tasks.find((x) => x.id === a.id);
-      if (!task || task.status === "done") return s;
-      return {
-        tasks: setStatus(s.tasks, a.id, { status: "done", doneAt: a.t }),
-        sessions: closeSpans(s.sessions, a.t, a.id),
-        waits: closeSpans(s.waits, a.t, a.id),
-        log: withLog(s, entry(a.t, "done", task)),
-      };
-    }
-    case "reopen": {
-      const task = s.tasks.find((x) => x.id === a.id);
-      if (!task || task.status !== "done") return s;
-      return {
-        ...s,
-        tasks: setStatus(s.tasks, a.id, { status: "todo", doneAt: null }),
-        log: withLog(s, entry(a.t, "reopen", task)),
-      };
-    }
-    case "remove": {
-      const task = s.tasks.find((x) => x.id === a.id);
-      if (!task) return s;
-      return {
-        tasks: s.tasks.filter((x) => x.id !== a.id),
-        sessions: s.sessions.filter((x) => x.taskId !== a.id),
-        waits: s.waits.filter((x) => x.taskId !== a.id),
-        log: withLog(s, entry(a.t, "remove", task)),
-      };
-    }
-  }
-}
-
-type LegacyTask = Omit<Task, "startAt" | "endAt" | "steps"> &
-  Partial<Pick<Task, "startAt" | "endAt" | "steps">> & { due?: number | null };
-function migrate(t: LegacyTask): Task {
-  const { due, ...rest } = t;
-  return { ...rest, startAt: rest.startAt ?? null, endAt: rest.endAt ?? due ?? null, steps: (rest.steps ?? []).map((st) => ({ ...st, phase: st.phase ?? "during" })) };
-}
-
-function load(): State | null {
-  try {
-    const raw = localStorage.getItem(KEY);
-    if (!raw) return null;
-    const p = JSON.parse(raw) as Partial<State>;
-    if (Array.isArray(p.tasks) && Array.isArray(p.sessions) && Array.isArray(p.waits) && Array.isArray(p.log)) {
-      return { ...(p as State), tasks: (p.tasks as unknown as LegacyTask[]).map(migrate) };
-    }
-  } catch {
-    /* corrupted or blocked storage -> start clean */
-  }
-  return null;
-}
-
-/* ----------------------------- small components ----------------------------- */
-
-/** Ticks on its own so the page doesn't re-render every second. */
-function Live({ read, every = 1000 }: { read: (now: number) => string; every?: number }) {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const tick = () => setNow(Date.now());
-    tick();
-    const id = setInterval(tick, every);
-    document.addEventListener("visibilitychange", tick);
-    return () => {
-      clearInterval(id);
-      document.removeEventListener("visibilitychange", tick);
-    };
-  }, [every]);
-  return <>{read(now)}</>;
-}
-
-type Variant = "solid" | "ghost" | "onBlue" | "danger";
-const variantStyle: Record<Variant, CSSProperties> = {
-  solid: { background: C.blue, color: "#fff", borderColor: C.blue },
-  ghost: { background: "transparent", color: C.ink, borderColor: C.line },
-  onBlue: { background: "rgba(255,255,255,0.16)", color: "#fff", borderColor: "rgba(255,255,255,0.35)" },
-  danger: { background: "transparent", color: C.red, borderColor: C.line },
-};
-function Btn(props: {
-  variant?: Variant;
-  icon?: ReactNode;
-  children?: ReactNode;
-  onClick?: () => void;
-  title?: string;
-  type?: "button" | "submit";
-}) {
-  const { variant = "ghost", icon, children, onClick, title, type = "button" } = props;
-  return (
-    <motion.button
-      type={type}
-      title={title}
-      aria-label={title}
-      onClick={onClick}
-      whileTap={{ scale: 0.96 }}
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        gap: 6,
-        minHeight: 40,
-        minWidth: 40,
-        padding: children ? "0 14px" : "0 10px",
-        borderRadius: 10,
-        border: "1px solid",
-        fontFamily: BODY,
-        fontWeight: 600,
-        fontSize: 14,
-        cursor: "pointer",
-        ...variantStyle[variant],
-      }}
-    >
-      {icon}
-      {children}
-    </motion.button>
-  );
-}
-
-function RatingInput(p: { label: string; hint: string; value: Rating; onChange: (v: Rating) => void }) {
-  return (
-    <div style={{ display: "grid", gap: 6 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline", flexWrap: "wrap" }}>
-        <span style={{ fontWeight: 600, fontSize: 13 }}>{p.label}</span>
-        <span style={{ fontSize: 12, color: C.muted }}>{p.hint}</span>
-      </div>
-      <div role="radiogroup" aria-label={p.label} style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 4 }}>
-        {([1, 2, 3, 4, 5] as Rating[]).map((n) => {
-          const on = p.value === n;
-          return (
-            <motion.button
-              key={n}
-              type="button"
-              role="radio"
-              aria-checked={on}
-              whileTap={{ scale: 0.94 }}
-              onClick={() => p.onChange(n)}
-              style={{
-                minHeight: 40,
-                borderRadius: 8,
-                border: `1px solid ${on ? C.blue : C.line}`,
-                background: on ? C.blue : "#fff",
-                color: on ? "#fff" : C.ink,
-                fontFamily: BODY,
-                fontWeight: 600,
-                fontSize: 14,
-                cursor: "pointer",
-              }}
-            >
-              {n}
-            </motion.button>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-const card: CSSProperties = { background: C.surface, border: `1px solid ${C.line}`, borderRadius: 14, padding: 16 };
-const h3: CSSProperties = { fontFamily: HEAD, fontSize: 19, fontWeight: 700, margin: 0, letterSpacing: "-0.01em" };
-const sub: CSSProperties = { fontSize: 13, color: C.muted, margin: "4px 0 0" };
-const ellipsis: CSSProperties = { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 };
-const inputStyle: CSSProperties = {
-  minHeight: 44,
-  borderRadius: 10,
-  border: `1px solid ${C.line}`,
-  background: "#fff",
-  padding: "0 12px",
-  fontFamily: BODY,
-  fontSize: 15,
-  color: C.ink,
-  width: "100%",
-  boxSizing: "border-box",
-};
-
-const chipBtn: CSSProperties = {
-  minHeight: 36,
-  padding: "0 12px",
-  borderRadius: 999,
-  border: `1px solid ${C.line}`,
-  background: "#fff",
-  color: C.ink,
-  fontFamily: BODY,
-  fontWeight: 600,
-  fontSize: 13,
-  cursor: "pointer",
-};
-
-function RatingGrid({ task, dispatch }: { task: Task; dispatch: Dispatch<Action> }) {
-  return (
-    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 230px), 1fr))", gap: 12, paddingTop: 12 }}>
-      {RATINGS.map((rt) => (
-        <RatingInput
-          key={rt.key}
-          label={rt.label}
-          hint={rt.hint}
-          value={task[rt.key]}
-          onChange={(value) => dispatch({ type: "rate", id: task.id, key: rt.key, value })}
-        />
-      ))}
-    </div>
-  );
-}
-
-/** Before / During / After. In each phase the best-scoring option wins and becomes the way the task is done. */
-function StepEditor({ task, dispatch }: { task: Task; dispatch: Dispatch<Action> }) {
-  const [phase, setPhase] = useState<Phase>("during");
-  const [text, setText] = useState("");
-  const [vals, setVals] = useState<Record<StepKey, Rating>>({ quality: 3, probability: 3, effort: 3 });
-  const plan = phasePlan(task);
-  const add = () => {
-    const clean = text.trim();
-    if (!clean) return;
-    dispatch({ type: "addStep", taskId: task.id, step: { id: uid(), text: clean, phase, ...vals, done: false, doneAt: null } });
-    setText("");
-    setVals({ quality: 3, probability: 3, effort: 3 });
+  const place = (b: Block, from: number) => {
+    let t = from;
+    let c: Block | undefined;
+    while ((c = placed.find((x) => x.start < t + b.dur && t < x.start + x.dur))) t = c.start + c.dur;
+    b.start = t;
+    placed.push(b);
+    return t + b.dur;
   };
-  return (
-    <div style={{ display: "grid", gap: 14 }}>
-      {plan.map((p) => (
-        <div key={p.phase} style={{ display: "grid", gap: 6 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
-            <span style={{ fontWeight: 700, fontSize: 15, fontFamily: HEAD }}>{p.label}</span>
-            <span style={{ fontSize: 12, color: C.muted }}>{PHASES.find((x) => x.key === p.phase)?.hint}</span>
-          </div>
-          {p.steps.length === 0 && <span style={{ color: C.muted, fontSize: 13 }}>No options yet.</span>}
-          {p.steps.map((st, i) => (
-            <div
-              key={st.id}
-              style={{
-                display: "grid",
-                gap: 6,
-                border: `1px solid ${i === 0 ? C.blue : C.line}`,
-                borderRadius: 10,
-                padding: "8px 10px",
-                background: st.done ? C.track : "#fff",
-              }}
-            >
-              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                <Btn
-                  variant={st.done ? "solid" : "ghost"}
-                  icon={<Check size={16} />}
-                  title={st.done ? "Mark not done" : "Mark done"}
-                  onClick={() => dispatch({ type: "toggleStep", taskId: task.id, stepId: st.id, t: Date.now() })}
-                />
-                <span style={{ flex: 1, minWidth: 0, overflowWrap: "anywhere", fontSize: 14, textDecoration: st.done ? "line-through" : "none", color: st.done ? C.muted : C.ink }}>
-                  {st.text}
-                </span>
-                {i === 0 && (
-                  <span style={{ background: C.blue, color: "#fff", borderRadius: 999, padding: "2px 9px", fontSize: 11, fontWeight: 600 }}>
-                    {p.complete ? "Used" : "Winner"}
-                  </span>
-                )}
-                <span style={{ fontSize: 12, color: C.muted }} title="Action score">{Math.round(stepScore(st))}</span>
-                <Btn variant="danger" icon={<Trash2 size={15} />} title="Delete action" onClick={() => dispatch({ type: "removeStep", taskId: task.id, stepId: st.id })} />
-              </div>
-              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                {STEP_METRICS.map((m) => (
-                  <button
-                    key={m.key}
-                    type="button"
-                    title={`${m.label}. ${m.hint}. Tap to change.`}
-                    onClick={() => dispatch({ type: "rateStep", taskId: task.id, stepId: st.id, key: m.key, value: ((st[m.key] % 5) + 1) as Rating })}
-                    style={chipBtn}
-                  >
-                    {m.short} {st[m.key]}
-                  </button>
-                ))}
-              </div>
-            </div>
-          ))}
-        </div>
-      ))}
+  let cur = startAt;
+  for (const b of flow) cur = place(b, cur);
+  const morningEnd = cur;
+  cur = place(R('str', 'Strength exercise', 40, 'gym', 'Mid-day. Warm up first.'), Math.max(cur, 720));
+  place(R('car', 'Cardio', 45, 'cardio', 'Steady pace for 45 minutes.'), cur);
 
-      <div style={{ display: "grid", gap: 10, borderTop: `1px solid ${C.line}`, paddingTop: 12 }}>
-        <div style={{ fontWeight: 600, fontSize: 14 }}>Add an option</div>
-        <div role="radiogroup" aria-label="Phase" style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6 }}>
-          {PHASES.map((ph) => {
-            const on = phase === ph.key;
-            return (
-              <button
-                key={ph.key}
-                type="button"
-                role="radio"
-                aria-checked={on}
-                onClick={() => setPhase(ph.key)}
-                style={{ ...chipBtn, minHeight: 40, borderRadius: 10, background: on ? C.blue : "#fff", color: on ? "#fff" : C.ink, borderColor: on ? C.blue : C.line }}
-              >
-                {ph.label}
-              </button>
-            );
-          })}
-        </div>
-        <input
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              add();
-            }
-          }}
-          placeholder="A specific action for this phase"
-          aria-label="New action"
-          style={inputStyle}
-        />
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 230px), 1fr))", gap: 12 }}>
-          {STEP_METRICS.map((m) => (
-            <RatingInput key={m.key} label={m.label} hint={m.hint} value={vals[m.key]} onChange={(v) => setVals((p) => ({ ...p, [m.key]: v }))} />
-          ))}
-        </div>
-        <div>
-          <Btn variant="solid" icon={<Plus size={16} />} onClick={add}>Add option</Btn>
-        </div>
+  // sleep can move later (up to 11 pm) when tasks run late
+  const base = toMin(s.sleep);
+  const lastEnd = Math.max(0, ...fixed.map((b) => b.start + b.dur));
+  let sleepAt = base;
+  let note = '';
+  if (lastEnd + EV > base) {
+    sleepAt = Math.max(base, Math.min(lastEnd + EV, 1380));
+    note = `Sleep moved to ${fmt(sleepAt)} for your tasks.` + (lastEnd + EV > 1380 ? ' Tasks run past the 11 pm limit.' : '');
+  }
+
+  const flex = todays.filter((t) => !t.time).sort((x, y) => y.pri - x.pri || (x.deadline || '9').localeCompare(y.deadline || '9'));
+  for (const t of flex) {
+    const b = R('t:' + t.id, t.title, t.dur, 'task', info(t), { kind: 'task', pri: t.pri });
+    place(b, morningEnd);
+    if (b.start + b.dur > sleepAt - EV) { b.warn = true; b.note += ', may not fit today'; }
+  }
+
+  for (const b of later) {
+    place(b, morningEnd);
+    if (b.start + b.dur > sleepAt - EV) { b.warn = true; b.note = (b.note ?? '') + ' May not fit today.'; }
+  }
+
+  // call with Yuni: your free gaps (midday to night) overlapped with her free times
+  const wins = s.yuni.today[date] ?? s.yuni.usual;
+  const gaps: [number, number][] = [];
+  let pc = CALL.from;
+  for (const b of [...placed].sort((a, c) => a.start - c.start)) {
+    if (b.start > pc) gaps.push([pc, Math.min(b.start, sleepAt - EV)]);
+    pc = Math.max(pc, b.start + b.dur);
+  }
+  if (sleepAt - EV > pc) gaps.push([pc, sleepAt - EV]);
+  const cands = gaps
+    .flatMap((g): [number, number][] => (wins.length ? wins.map((w): [number, number] => [Math.max(g[0], toMin(w.s)), Math.min(g[1], toMin(w.e))]) : [g]))
+    .filter(([a, e]) => e - a >= CALL.min);
+  const best = cands.sort((a, c) => c[1] - c[0] - (a[1] - a[0]) || a[0] - c[0])[0];
+  if (!ac && best) {
+    placed.push(R('call', 'Call with Yuni', Math.min(CALL.max, best[1] - best[0]), 'call', wins.length ? 'Shared free time. You can also start it anytime from the call card.' : 'Not confirmed with Yuni yet. Ask her first.', { start: best[0], kind: 'call' }));
+  }
+
+  let t = sleepAt - EV;
+  for (const b of [R('teeth2', 'Brush teeth', 3, 'sparkle'), R('face2', 'Wash face', 2, 'smile'), R('moist2', 'Moisturize', 2, 'smile'), R('pm', 'Good night to Yuni', 1, 'heart', PM[h % PM.length], { msg: true })]) {
+    b.start = t; t += b.dur; placed.push(b);
+  }
+  const rest = toMin(s.wake) + 1440 - sleepAt;
+  placed.push(R('sleep', 'Sleep', rest, 'sleep', `Lights out. ${(rest / 60).toFixed(1)} hours until ${fmt(toMin(s.wake))}.`, { start: sleepAt, kind: 'sleep' }));
+  return { blocks: placed.sort((a, b) => a.start - b.start), note, minimal, gaps, best };
+}
+
+const S: Record<string, CSSProperties> = {
+  card: { background: '#1b1f2b', border: '1px solid #2a3042', borderRadius: 16, padding: 16, marginBottom: 12 },
+  inp: { background: '#12151d', border: '1px solid #2f3650', color: '#eceef6', borderRadius: 10, padding: '9px 11px', fontSize: 14, width: '100%', boxSizing: 'border-box', colorScheme: 'dark' },
+  lab: { display: 'block', fontSize: 12, color: '#98a1bd', margin: '12px 0 4px' },
+  btn: { background: '#ffb38a', color: '#2a1608', border: 0, borderRadius: 12, padding: '13px 16px', fontSize: 15, fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, width: '100%' },
+  chip: { background: '#12151d', border: '1px solid #2f3650', color: '#b3bad3', borderRadius: 999, padding: '6px 12px', fontSize: 13, cursor: 'pointer' },
+  row: { display: 'flex', gap: 8 },
+  warn: { background: '#3a2f1c', border: '1px solid #5b4a26', color: '#f2d9a0', borderRadius: 12, padding: '10px 12px', fontSize: 13, marginBottom: 12 },
+  muted: { color: '#98a1bd', fontSize: 13, margin: '6px 0 0' },
+};
+
+const Chip = ({ on, c = '#ffb38a', onClick, children }: { on: boolean; c?: string; onClick: () => void; children: ReactNode }) => (
+  <button type="button" onClick={onClick} style={{ ...S.chip, ...(on ? { background: c, borderColor: c, color: '#1a1208', fontWeight: 700 } : {}) }}>{children}</button>
+);
+const Lab = ({ t }: { t: string }) => <label style={S.lab}>{t}</label>;
+
+const Wins = ({ w, set }: { w: Win[]; set: (w: Win[]) => void }) => {
+  const [a, setA] = useState('18:00');
+  const [b, setB] = useState('21:00');
+  return (
+    <div>
+      <div style={{ ...S.row, flexWrap: 'wrap', marginTop: 8 }}>
+        {w.map((x, i) => (
+          <button key={i} style={{ ...S.chip, display: 'inline-flex', gap: 6, alignItems: 'center' }} aria-label="Remove time window" onClick={() => set(w.filter((_, j) => j !== i))}>
+            {fmt(toMin(x.s))} to {fmt(toMin(x.e))} <Trash2 size={12} />
+          </button>
+        ))}
+      </div>
+      <div style={{ ...S.row, marginTop: 8 }}>
+        <input type="time" style={S.inp} value={a} onChange={(e) => setA(e.target.value)} />
+        <input type="time" style={S.inp} value={b} onChange={(e) => setB(e.target.value)} />
+        <button style={S.chip} aria-label="Add time window" onClick={() => a && b && toMin(b) > toMin(a) && set([...w, { s: a, e: b }])}><Plus size={16} /></button>
       </div>
     </div>
   );
-}
-
-/* ----------------------------- page ----------------------------- */
+};
 
 export default function Page() {
-  const [state, dispatch] = useReducer(reducer, EMPTY);
+  const [st, setSt] = useState<Store>(DEF);
   const [ready, setReady] = useState(false);
-  const [now, setNow] = useState(0); // coarse clock for ranking (15s)
-  const [openId, setOpenId] = useState<string | null>(null);
-  const [dismissed, setDismissed] = useState<string | null>(null);
-  const lastSaved = useRef("");
+  const [tab, setTab] = useState<'today' | 'tasks' | 'settings'>('today');
+  const [now, setNow] = useState(0);
+  const [today, setToday] = useState('');
+  const [f, setF] = useState(BLANK);
+  const [pf, setPf] = useState({ name: '', min: 30 });
+  const [cl, setCl] = useState(45);
+  const [cf, setCf] = useState(CBLANK);
 
-  const [title, setTitle] = useState("");
-  const [est, setEst] = useState("25");
-  const [startAt, setStartAt] = useState("");
-  const [endAt, setEndAt] = useState("");
-  const [formError, setFormError] = useState("");
-  const [draft, setDraft] = useState<Record<RateKey, Rating>>({
-    importance: 3,
-    urgency: 3,
-    consequence: 3,
-    opportunity: 3,
-  });
-
-  /* load + cross-tab sync */
   useEffect(() => {
-    const s = load();
-    if (s) {
-      lastSaved.current = JSON.stringify(s);
-      dispatch({ type: "hydrate", state: s });
-    }
+    try { const r = localStorage.getItem(KEY); if (r) setSt({ ...DEF, ...JSON.parse(r) }); } catch { /* ignore */ }
+    const tick = () => { const d = new Date(); setToday(ymd(d)); setNow(d.getHours() * 60 + d.getMinutes()); };
+    tick();
     setReady(true);
-    const onStorage = (e: StorageEvent) => {
-      if (e.key !== KEY || !e.newValue || e.newValue === lastSaved.current) return;
-      const next = load();
-      if (next) {
-        lastSaved.current = e.newValue;
-        dispatch({ type: "hydrate", state: next });
-      }
-    };
-    window.addEventListener("storage", onStorage);
-    return () => window.removeEventListener("storage", onStorage);
+    const i = setInterval(tick, 30000);
+    return () => clearInterval(i);
   }, []);
-
-  /* persist */
   useEffect(() => {
     if (!ready) return;
-    const raw = JSON.stringify(state);
-    if (raw === lastSaved.current) return;
-    try {
-      localStorage.setItem(KEY, raw);
-      lastSaved.current = raw;
-    } catch {
-      /* quota or private mode: keep working in memory */
-    }
-  }, [state, ready]);
+    try { localStorage.setItem(KEY, JSON.stringify(st)); } catch { /* ignore */ }
+  }, [st, ready]);
 
-  /* coarse clock: re-rank as time passes without per-second renders */
-  useEffect(() => {
-    const tick = () => setNow(Date.now());
-    tick();
-    const id = setInterval(tick, 15000);
-    document.addEventListener("visibilitychange", tick);
-    return () => {
-      clearInterval(id);
-      document.removeEventListener("visibilitychange", tick);
-    };
-  }, []);
+  const up = (p: Partial<Store>) => setSt((s) => ({ ...s, ...p }));
+  const plan = useMemo(() => (today ? buildDay(st, today, st.started[today] ?? toMin(st.wake)) : null), [st, today]);
+  if (!ready || !plan) return <div style={{ position: 'fixed', inset: 0, background: '#12151d' }} />;
 
-  /* -- derived -- */
-  const d = useMemo(() => {
-    const open = state.sessions.find((x) => x.end === null) ?? null;
-    const todo = state.tasks.filter((t) => t.status === "todo");
-    const available = (t: Task) => t.startAt === null || now >= t.startAt || t.id === open?.taskId;
-    const ranked: Row[] = todo
-      .filter(available)
-      .map((t) => scoreTask(t, overlap(state.sessions, now, 0, t.id), now))
-      .sort(byRank);
-    const upcoming = todo.filter((t) => !available(t)).sort((a, b) => (a.startAt ?? 0) - (b.startAt ?? 0));
-    const activeRow = open ? ranked.find((r) => r.task.id === open.taskId) ?? null : null;
-    const lead = ranked[0] ?? null;
-    const focus = activeRow ?? lead;
+  const started = st.started[today] !== undefined;
+  const isDone = (id: string) => !!st.done[today + '|' + id];
+  const toggle = (id: string) => up({ done: { ...st.done, [today + '|' + id]: !isDone(id) } });
+  const next = plan.blocks.find((b) => !isDone(b.id));
+  const doneN = plan.blocks.filter((b) => isDone(b.id)).length;
+  const NI = next ? IC[next.icon] ?? Sparkles : Sparkles;
+  const pr = st.pris[today] ?? ['', '', ''];
+  const sug = plan.blocks.filter((b) => b.kind === 'task').sort((a, b) => (b.pri ?? 0) - (a.pri ?? 0)).slice(0, 3).map((b) => b.label);
+  const copy = (t: string) => { try { navigator.clipboard.writeText(t).catch(() => undefined); } catch { /* ignore */ } };
+  const kindColor = (b: Block) => (b.kind === 'task' ? PC[(b.pri ?? 3) - 1] : b.kind === 'prep' ? '#5fc4b8' : b.kind === 'call' ? '#f29fc0' : b.kind === 'sleep' ? '#a99bff' : '#566086');
 
-    let advice: Advice | null = null;
-    const nextFixed = upcoming[0] ?? null;
-    if (nextFixed && nextFixed.startAt !== null && nextFixed.startAt - now <= HEADS_UP_MIN * 60000) {
-      advice = {
-        kind: "fixed",
-        key: `f:${nextFixed.id}`,
-        text: `\u201C${nextFixed.title}\u201D starts at ${fmtClock(nextFixed.startAt)} (in ${fmtDur(nextFixed.startAt - now)}). ${activeRow ? "Wrap up or pause this one." : "Only start something short before then."}`,
-      };
-    } else if (activeRow) {
-      const best = ranked.find((r) => r.task.id !== activeRow.task.id);
-      if (best && best.score > activeRow.score + SWITCH_MARGIN) {
-        advice = {
-          kind: "switch",
-          key: `s:${activeRow.task.id}:${best.task.id}`,
-          target: best,
-          text: `\u201C${best.task.title}\u201D now outranks this by ${Math.round(best.score - activeRow.score)} points${best.inWindow ? " and its time window is open" : ""}. Switch only if it's worth the handoff.`,
-        };
-      } else if (activeRow.activeMs > activeRow.task.estMin * 60000 * 1.25) {
-        advice = {
-          kind: "overrun",
-          key: `o:${activeRow.task.id}`,
-          text: `${fmtDur(activeRow.activeMs - activeRow.task.estMin * 60000)} past your estimate. Finish it, re-scope it, or stop and mark it blocked.`,
-        };
-      }
-    }
-
-    /* timeline: fixed windows are immovable; the active task goes first,
-       then everything else is fitted by rank into the earliest gap that holds it */
-    const toMin = (ms: number) => (ms - now) / 60000;
-    const busy: { s: number; e: number }[] = [];
-    const fixedRaw = upcoming.map((t) => {
-      const s0 = toMin(t.startAt ?? now);
-      const e0 = t.endAt !== null ? toMin(t.endAt) : s0 + t.estMin;
-      busy.push({ s: s0, e: e0 });
-      return { row: scoreTask(t, 0, now), s: s0, e: e0 };
-    });
-    const clash = new Set<string>();
-    const fx = [...fixedRaw].sort((a, b) => a.s - b.s);
-    fx.forEach((b, i) => {
-      const n = fx[i + 1];
-      if (n && n.s < b.e) {
-        clash.add(b.row.task.id);
-        clash.add(n.row.task.id);
-      }
-    });
-    const fit = (dur: number) => {
-      let start = 0;
-      for (const b of [...busy].sort((x, y) => x.s - y.s)) {
-        if (start + dur <= b.s) break;
-        start = Math.max(start, b.e);
-      }
-      return start;
-    };
-    const flexible = [...(activeRow ? [activeRow] : []), ...ranked.filter((r) => r.task.id !== activeRow?.task.id)];
-    const flexBlocks = flexible.map((r) => {
-      const dur = Math.max(5, r.task.estMin - r.activeMs / 60000);
-      const startMin = r === activeRow ? 0 : fit(dur);
-      busy.push({ s: startMin, e: startMin + dur });
-      const endMs = now + (startMin + dur) * 60000;
-      return { ...r, startMin, durMin: dur, endMs, late: r.task.endAt !== null && endMs > r.task.endAt, fixed: false, clash: false };
-    });
-    const fixedBlocks = fixedRaw.map((b) => ({
-      ...b.row,
-      startMin: b.s,
-      durMin: Math.max(5, b.e - b.s),
-      endMs: now + b.e * 60000,
-      late: false,
-      fixed: true,
-      clash: clash.has(b.row.task.id),
-    }));
-    const blocks = [...fixedBlocks, ...flexBlocks].sort((a, b) => a.startMin - b.startMin);
-    const total = blocks.reduce((m, b) => Math.max(m, b.startMin + b.durMin), 0);
-    const dueMins = blocks
-      .map((b) => (b.task.endAt !== null ? toMin(b.task.endAt) : 0))
-      .filter((m) => m > 0 && m <= Math.max(total * 2, 120));
-    const horizon = Math.max(60, total, ...dueMins) * 1.05;
-
-    /* metrics (today) */
-    const from = startOfDay(now);
-    const doneToday = state.tasks.filter((t) => t.status === "done" && (t.doneAt ?? 0) >= from);
-    const value = doneToday.reduce((a, t) => a + t.importance + t.consequence + t.opportunity, 0);
-    const focusMs = overlap(state.sessions, now, from);
-    const waitMs = overlap(state.waits, now, from);
-    const switches = state.log.filter((l) => l.type === "switch" && l.t >= from).length;
-    const stepsToday = state.tasks.reduce((a, t) => a + t.steps.filter((x) => x.doneAt !== null && x.doneAt >= from).length, 0);
-
-    return {
-      open,
-      ranked,
-      activeRow,
-      lead,
-      focus,
-      advice,
-      blocks,
-      horizon,
-      upcoming,
-      stepsToday,
-      doneToday: doneToday.length,
-      value,
-      focusMs,
-      waitMs,
-      switches,
-      waiting: state.tasks.filter((t) => t.status === "waiting"),
-      finished: state.tasks
-        .filter((t) => t.status === "done")
-        .sort((a, b) => (b.doneAt ?? 0) - (a.doneAt ?? 0))
-        .slice(0, 5),
-    };
-  }, [state, now]);
-
-  const act = {
-    start: (id: string) => dispatch({ type: "start", id, t: Date.now() }),
-    pause: () => dispatch({ type: "pause", t: Date.now() }),
-    wait: (id: string) => dispatch({ type: "wait", id, t: Date.now() }),
-    unblock: (id: string) => dispatch({ type: "unblock", id, t: Date.now() }),
-    done: (id: string) => dispatch({ type: "done", id, t: Date.now() }),
-    reopen: (id: string) => dispatch({ type: "reopen", id, t: Date.now() }),
-    remove: (id: string) => dispatch({ type: "remove", id, t: Date.now() }),
+  const addTask = () => {
+    if (!f.title.trim()) return;
+    const date = f.date || today;
+    const days = f.repeat === 'weekly' && !f.days.length ? [dowOf(date)] : f.days;
+    up({ tasks: [...st.tasks, { ...f, id: uid(), title: f.title.trim(), date, days, dur: Math.max(5, f.dur) }] });
+    setF(BLANK);
+  };
+  const addPrep = () => {
+    if (!pf.name.trim()) return;
+    up({ preps: [...st.preps, { id: uid(), name: pf.name.trim(), min: Math.max(1, pf.min) }] });
+    setPf({ name: '', min: 30 });
+  };
+  const resetToday = () => {
+    const ss = { ...st.started };
+    delete ss[today];
+    up({ started: ss, done: Object.fromEntries(Object.entries(st.done).filter(([k]) => !k.startsWith(today + '|'))) });
   };
 
-  const submit = (e: FormEvent) => {
-    e.preventDefault();
-    const clean = title.trim();
-    if (!clean) return;
-    const sRaw = startAt ? new Date(startAt).getTime() : NaN;
-    const eRaw = endAt ? new Date(endAt).getTime() : NaN;
-    const startMs = Number.isNaN(sRaw) ? null : sRaw;
-    const endMs = Number.isNaN(eRaw) ? null : eRaw;
-    if (startMs !== null && endMs !== null && endMs <= startMs) {
-      setFormError("The end time must be after the start time.");
-      return;
-    }
-    setFormError("");
-    dispatch({
-      type: "add",
-      task: {
-        id: uid(),
-        title: clean,
-        ...draft,
-        estMin:
-          startMs !== null && endMs !== null
-            ? clamp(Math.round((endMs - startMs) / 60000), 5, 1440)
-            : clamp(Math.round(Number(est)) || 25, 5, 1440),
-        startAt: startMs,
-        endAt: endMs,
-        steps: [],
-        createdAt: Date.now(),
-        status: "todo",
-        doneAt: null,
-      },
-    });
-    setTitle("");
-    setStartAt("");
-    setEndAt("");
-    setEst("25");
-    setDraft({ importance: 3, urgency: 3, consequence: 3, opportunity: 3 });
+  const ac = st.call[today];
+  const left = ac ? ac.start + ac.len - now : 0;
+  const yw = st.yuni.today[today] ?? st.yuni.usual;
+  const free = plan.gaps.filter(([a, e]) => e - a >= CALL.min).map(([a, e]) => `${fmt(a)} to ${fmt(e)}`).join(', ');
+  const ask = `Hi Yuni! Are you free for an uninterrupted call today? I can do ${free || 'later tonight'}. What time works for you?`;
+  const startCall = (len: number) => up({ call: { ...st.call, [today]: { start: now, len } } });
+  const addCare = () => {
+    if (!cf.label.trim()) return;
+    up({ care: [...st.care, { id: uid(), label: cf.label.trim(), icon: 'cut', dur: Math.max(1, cf.dur), slot: cf.slot, last: cf.last, ...(cf.mode === 'days' ? { days: cf.days } : { every: Math.max(1, cf.every) }) }] });
+    setCf(CBLANK);
   };
 
-  const exportJson = () => {
-    const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `top1-${new Date().toISOString().slice(0, 10)}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  const globalCss = `
-    @import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=Instrument+Sans:wght@400;500;600&display=swap');
-    * { box-sizing: border-box; }
-    html, body { margin: 0; background: ${C.bg}; }
-    button:focus-visible, input:focus-visible { outline: 3px solid ${C.blue}; outline-offset: 2px; }
-    ::selection { background: ${C.blueSoft}; }
-  `;
-
-  if (!ready || now === 0) {
-    return (
-      <main style={{ minHeight: "100dvh", background: C.bg }}>
-        <style>{globalCss}</style>
-      </main>
-    );
-  }
-
-  const { focus, activeRow, advice } = d;
-  const focusPlan = focus ? phasePlan(focus.task) : [];
-  const currentPhase = focusPlan.find((x) => x.steps.length > 0 && !x.complete) ?? null;
-  const hasPlan = focusPlan.some((x) => x.steps.length > 0);
-  const showAdvice = advice && advice.key !== dismissed;
-  const pct = activeRow ? clamp((activeRow.activeMs / (activeRow.task.estMin * 60000)) * 100, 0, 100) : 0;
-  const axis = [0, 0.25, 0.5, 0.75, 1].map((f) => now + f * d.horizon * 60000);
+  const tabs: [typeof tab, string, LucideIcon][] = [['today', 'Today', Sun], ['tasks', 'Tasks', ListTodo], ['settings', 'Settings', Settings]];
 
   return (
-    <MotionConfig reducedMotion="user">
-      <style>{globalCss}</style>
-      <main style={{ minHeight: "100dvh", background: C.bg, color: C.ink, fontFamily: BODY, padding: "22px 16px 72px" }}>
-        <div style={{ maxWidth: 1040, margin: "0 auto", display: "grid", gap: 18 }}>
-          {/* header */}
-          <header>
-            <h1 style={{ fontFamily: HEAD, fontWeight: 800, fontSize: "clamp(34px, 7vw, 52px)", margin: 0, letterSpacing: "-0.03em" }}>
-              Top 1
-            </h1>
-            <p style={{ margin: "4px 0 0", color: C.muted, fontSize: 15 }}>
-              One task at a time. Ranked against the clock, re-ranked as it moves.
-            </p>
-          </header>
+    <div style={{ position: 'fixed', inset: 0, overflowY: 'auto', background: '#12151d', color: '#eceef6', fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif' }}>
+      <div style={{ maxWidth: 520, margin: '0 auto', padding: '20px 16px 48px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+          <div>
+            <div style={{ fontSize: 22, fontWeight: 800 }}>Next action</div>
+            <div style={S.muted}>{new Date(today + 'T00:00').toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}</div>
+          </div>
+          <div style={{ textAlign: 'right', fontSize: 13, color: '#98a1bd' }}><Moon size={14} style={{ verticalAlign: -2 }} /> {fmt(toMin(st.sleep))} to {fmt(toMin(st.wake))}</div>
+        </div>
 
-          {/* lead / active */}
-          <motion.section
-            layout
-            style={{
-              background: C.blue,
-              color: "#fff",
-              borderRadius: 24,
-              padding: "22px 20px",
-              display: "grid",
-              gap: 14,
-              overflow: "hidden",
-            }}
-          >
-            {focus ? (
+        <div style={{ ...S.row, marginBottom: 14 }}>
+          {tabs.map(([k, label, Ico]) => (
+            <button key={k} onClick={() => setTab(k)} style={{ ...S.chip, flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, ...(tab === k ? { background: '#2a3042', color: '#fff', borderColor: '#566086' } : {}) }}>
+              <Ico size={15} /> {label}
+            </button>
+          ))}
+        </div>
+
+        {tab === 'today' && (
+          <>
+            {!started ? (
+              <div style={{ ...S.card, textAlign: 'center', padding: 28 }}>
+                <motion.div animate={{ rotate: 360 }} transition={{ repeat: Infinity, duration: 30, ease: 'linear' }} style={{ display: 'inline-block' }}><Sun size={56} color="#ffc27a" /></motion.div>
+                <h2 style={{ margin: '12px 0 4px' }}>Good morning</h2>
+                <p style={{ ...S.muted, margin: '0 0 18px' }}>Tap when you are awake. Your day will be planned from that moment.</p>
+                <motion.button whileTap={{ scale: 0.96 }} style={S.btn} onClick={() => up({ started: { ...st.started, [today]: now } })}><Play size={18} /> Start my day</motion.button>
+              </div>
+            ) : (
               <>
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", fontSize: 14, opacity: 0.9 }}>
-                  <span>{activeRow ? "In progress" : "Next up"}</span>
-                  <span>Priority {Math.round(focus.score)}</span>
+                {plan.minimal && <div style={S.warn}>Early commitment found. Minimal morning today: sunlight, priorities, food, shower, skin care. No deep work.</div>}
+                {plan.note && <div style={S.warn}>{plan.note}</div>}
+
+                <div style={{ height: 6, background: '#2a3042', borderRadius: 6, marginBottom: 12, overflow: 'hidden' }}>
+                  <motion.div animate={{ width: `${(doneN / plan.blocks.length) * 100}%` }} style={{ height: '100%', background: '#8fd0a4' }} />
                 </div>
 
-                <AnimatePresence mode="wait" initial={false}>
-                  <motion.h2
-                    key={focus.task.id}
-                    initial={{ opacity: 0, y: 10 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: -10 }}
-                    transition={{ duration: 0.2 }}
-                    style={{ fontFamily: HEAD, fontWeight: 800, fontSize: "clamp(26px, 6vw, 40px)", lineHeight: 1.08, margin: 0, letterSpacing: "-0.02em", overflowWrap: "anywhere" }}
-                  >
-                    {focus.task.title}
-                  </motion.h2>
-                </AnimatePresence>
-
-                {activeRow && d.open ? (
-                  <div style={{ display: "grid", gap: 8 }}>
-                    <div style={{ display: "flex", alignItems: "baseline", gap: 12, flexWrap: "wrap" }}>
-                      <span style={{ fontFamily: HEAD, fontWeight: 800, fontSize: "clamp(48px, 14vw, 88px)", lineHeight: 1, fontVariantNumeric: "tabular-nums", letterSpacing: "-0.03em" }}>
-                        <Live
-                          read={(n) =>
-                            fmtTimer(overlap(state.sessions, n, 0, activeRow.task.id))
-                          }
-                        />
-                      </span>
-                      <span style={{ fontSize: 15, opacity: 0.9 }}>of {activeRow.task.estMin} min planned</span>
-                    </div>
-                    <div style={{ height: 6, borderRadius: 3, background: "rgba(255,255,255,0.25)", overflow: "hidden" }}>
-                      <motion.div
-                        initial={false}
-                        animate={{ width: `${pct}%` }}
-                        transition={{ type: "spring", stiffness: 80, damping: 20 }}
-                        style={{ height: "100%", background: pct >= 100 ? "#FFD27A" : "#fff" }}
-                      />
-                    </div>
-                  </div>
-                ) : (
-                  <div style={{ fontSize: 15, opacity: 0.92 }}>
-                    {focus.task.estMin} min planned
-                    {fmtWhen(focus.task, now) ? `. ${fmtWhen(focus.task, now)}` : ""}
-                  </div>
-                )}
-
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                  {[
-                    ["Importance", focus.task.importance, false],
-                    ["Urgency", focus.urgency, focus.raisedByDeadline],
-                    ["Consequence", focus.task.consequence, false],
-                    ["Opportunity", focus.task.opportunity, false],
-                  ].map(([label, val, raised]) => (
-                    <span
-                      key={String(label)}
-                      title={raised ? "Raised automatically by the deadline" : undefined}
-                      style={{ background: "rgba(255,255,255,0.16)", borderRadius: 999, padding: "4px 11px", fontSize: 13, fontWeight: 500 }}
-                    >
-                      {label} {val}
-                      {raised ? " (deadline)" : ""}
-                    </span>
-                  ))}
-                </div>
-
-                <div style={{ background: "rgba(255,255,255,0.14)", borderRadius: 12, padding: "8px", display: "grid", gap: 4 }}>
-                  {hasPlan ? (
-                    <>
-                      {focusPlan.map((p) => {
-                        const w = p.winner;
-                        const isCur = currentPhase?.phase === p.phase;
-                        return (
-                          <div
-                            key={p.phase}
-                            style={{
-                              display: "flex",
-                              alignItems: "center",
-                              gap: 10,
-                              borderRadius: 8,
-                              padding: "6px 8px",
-                              background: isCur ? "rgba(255,255,255,0.22)" : "transparent",
-                              opacity: w ? 1 : 0.55,
-                            }}
-                          >
-                            <span style={{ width: 58, flexShrink: 0, fontSize: 13, fontWeight: 600 }}>{p.label}</span>
-                            <span style={{ flex: 1, minWidth: 0, overflowWrap: "anywhere", fontSize: 15, fontWeight: isCur ? 600 : 400, textDecoration: p.complete ? "line-through" : "none" }}>
-                              {w ? w.text : "No option yet"}
-                            </span>
-                            {p.complete && <Check size={16} />}
-                            {isCur && w && (
-                              <Btn
-                                variant="onBlue"
-                                icon={<Check size={18} />}
-                                title="Complete this action"
-                                onClick={() => dispatch({ type: "toggleStep", taskId: focus.task.id, stepId: w.id, t: Date.now() })}
-                              />
-                            )}
-                          </div>
-                        );
-                      })}
-                      <div style={{ fontSize: 12, opacity: 0.85, padding: "2px 8px" }}>
-                        {currentPhase
-                          ? `${currentPhase.label} winner, score ${Math.round(stepScore(currentPhase.winner as Step))}${currentPhase.steps.length > 1 ? `, beat ${currentPhase.steps.length - 1} other option${currentPhase.steps.length > 2 ? "s" : ""}` : ""}`
-                          : "Every phase is done. Finish the task."}
-                      </div>
-                    </>
-                  ) : (
-                    <div style={{ fontSize: 14, opacity: 0.92, padding: "4px 8px" }}>
-                      No actions yet. Open this task in the list below and add options for Before, During and After. The best-scoring option in each phase becomes the plan.
-                    </div>
-                  )}
-                </div>
-
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                  {activeRow ? (
-                    <>
-                      <Btn variant="onBlue" icon={<Check size={18} />} onClick={() => act.done(activeRow.task.id)}>Done</Btn>
-                      <Btn variant="onBlue" icon={<Pause size={18} />} onClick={act.pause}>Pause</Btn>
-                      <Btn variant="onBlue" icon={<Hourglass size={18} />} onClick={() => act.wait(activeRow.task.id)}>Blocked</Btn>
-                    </>
-                  ) : (
-                    <Btn variant="onBlue" icon={<Play size={18} />} onClick={() => act.start(focus.task.id)}>Start</Btn>
-                  )}
-                </div>
-
-                <AnimatePresence>
-                  {showAdvice && advice && (
-                    <motion.div
-                      key={advice.key}
-                      initial={{ opacity: 0, height: 0 }}
-                      animate={{ opacity: 1, height: "auto" }}
-                      exit={{ opacity: 0, height: 0 }}
-                      style={{ overflow: "hidden" }}
-                    >
-                      <div style={{ background: "#fff", color: C.ink, borderRadius: 12, padding: 12, display: "grid", gap: 10 }}>
-                        <div style={{ display: "flex", gap: 8, alignItems: "flex-start", fontSize: 14 }}>
-                          <AlertTriangle size={18} color={C.amber} style={{ flexShrink: 0, marginTop: 1 }} />
-                          <span>{advice.text}</span>
-                        </div>
-                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                          {advice.kind === "switch" && advice.target && (
-                            <Btn variant="solid" icon={<ArrowRightLeft size={16} />} onClick={() => act.start(advice.target!.task.id)}>
-                              Switch
-                            </Btn>
-                          )}
-                          <Btn onClick={() => setDismissed(advice.key)}>Keep going</Btn>
+                <AnimatePresence mode="wait">
+                  {next ? (
+                    <motion.div key={next.id} initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -18 }} transition={{ duration: 0.22 }} style={{ ...S.card, border: '1px solid #ffb38a66', background: '#221e26', padding: 20 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+                        <div style={{ width: 52, height: 52, borderRadius: 16, background: '#ffb38a22', display: 'grid', placeItems: 'center' }}><NI size={26} color="#ffb38a" /></div>
+                        <div>
+                          <div style={{ fontSize: 13, color: '#c9a58f' }}>Next action</div>
+                          <div style={{ fontSize: 22, fontWeight: 800, lineHeight: 1.2 }}>{next.label}</div>
                         </div>
                       </div>
+                      <p style={{ ...S.muted, marginTop: 14 }}><Clock size={13} style={{ verticalAlign: -2 }} /> {fmt(next.start)} to {fmt(next.start + next.dur)}, {next.dur} min</p>
+                      {next.note && <p style={{ margin: '10px 0 0', fontSize: 15, lineHeight: 1.5 }}>{next.note}</p>}
+                      {next.msg && next.note && <button onClick={() => copy(next.note as string)} style={{ ...S.chip, marginTop: 10, display: 'inline-flex', gap: 6, alignItems: 'center' }}><Copy size={14} /> Copy message</button>}
+                      <motion.button whileTap={{ scale: 0.96 }} onClick={() => (next.id === 'call' && !ac ? startCall(Math.min(CALL.max, next.dur)) : toggle(next.id))} style={{ ...S.btn, marginTop: 16 }}><Check size={18} /> {next.id === 'call' ? (ac ? 'End call' : 'Start call') : 'Done'}</motion.button>
+                    </motion.div>
+                  ) : (
+                    <motion.div key="end" initial={{ opacity: 0 }} animate={{ opacity: 1 }} style={{ ...S.card, textAlign: 'center', padding: 28 }}>
+                      <Moon size={40} color="#a99bff" />
+                      <h3 style={{ margin: '10px 0 0' }}>Everything is done. Rest well.</h3>
                     </motion.div>
                   )}
                 </AnimatePresence>
-              </>
-            ) : (
-              <div style={{ display: "grid", gap: 6 }}>
-                <h2 style={{ fontFamily: HEAD, fontWeight: 800, fontSize: 30, margin: 0 }}>Nothing queued</h2>
-                <p style={{ margin: 0, opacity: 0.92 }}>Add your first task below. The top-ranked one appears here.</p>
-              </div>
-            )}
-          </motion.section>
 
-          {/* metrics */}
-          <section style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 200px), 1fr))", gap: 12 }}>
-            <Metric
-              label="Valuable output"
-              big={String(d.value)}
-              note={`${d.doneToday} finished, ${d.stepsToday} actions today${d.focusMs > 60000 ? `, ${(d.value / (d.focusMs / 3600000)).toFixed(1)} per focus hour` : ""}`}
-            />
-            <Metric
-              label="Waiting time"
-              big={fmtDur(d.waitMs)}
-              note={d.waiting.length ? `${d.waiting.length} blocked right now` : "Nothing blocked"}
-              tone={d.waiting.length ? C.amber : undefined}
-            />
-            <Metric
-              label="Context switches"
-              big={String(d.switches)}
-              note={`${fmtDur(d.focusMs)} focused today`}
-              tone={d.switches > 3 ? C.red : undefined}
-            />
-          </section>
+                <div style={S.card}>
+                  <b style={{ fontSize: 15 }}>3 priorities for today</b>
+                  {[0, 1, 2].map((i) => (
+                    <input key={i} style={{ ...S.inp, marginTop: 8 }} placeholder={sug[i] ?? `Priority ${i + 1}`} value={pr[i] ?? ''} onChange={(e) => { const n = [...pr]; n[i] = e.target.value; up({ pris: { ...st.pris, [today]: n } }); }} />
+                  ))}
+                </div>
 
-          {/* timeline */}
-          <section style={card}>
-            <h3 style={h3}>Timeline from now</h3>
-            <p style={sub}>Projected order. Teal bars are fixed-time tasks. The vertical tick is an end time; red means a late finish or a clash.</p>
-            {d.blocks.length === 0 ? (
-              <p style={{ color: C.muted, margin: "14px 0 0", fontSize: 14 }}>Add tasks to see your day laid out.</p>
-            ) : (
-              <div style={{ display: "grid", gap: 10, marginTop: 14 }}>
-                <AnimatePresence initial={false}>
-                  {d.blocks.map((b, i) => {
-                    const left = (b.startMin / d.horizon) * 100;
-                    const width = Math.max(1.5, (b.durMin / d.horizon) * 100);
-                    const dueLeft = !b.fixed && b.task.endAt !== null ? clamp(((b.task.endAt - now) / 60000 / d.horizon) * 100, 0, 100) : null;
-                    const color = b.late || b.clash ? C.red : b.fixed ? C.teal : b.task.id === activeRow?.task.id ? C.blue : C.blueSoft;
+                <div style={{ ...S.card, borderColor: '#f29fc055' }}>
+                  <b style={{ fontSize: 15 }}><Phone size={15} style={{ verticalAlign: -2 }} /> Call with Yuni</b>
+                  {ac && !isDone('call') ? (
+                    <>
+                      <p style={{ margin: '10px 0 14px', fontSize: 15 }}>{left > 0 ? `${left} min left. Phone on do not disturb. Nothing else is scheduled.` : 'Time is up. Wrap up warmly.'}</p>
+                      <motion.button whileTap={{ scale: 0.96 }} style={S.btn} onClick={() => toggle('call')}><Check size={18} /> End call</motion.button>
+                    </>
+                  ) : isDone('call') ? (
+                    <p style={S.muted}>Call finished. Nice.</p>
+                  ) : (
+                    <>
+                      <p style={S.muted}>Your free time, midday to night: {free || 'none yet'}</p>
+                      <p style={{ ...S.muted, marginTop: 10 }}>Yuni free times today (usual times are in Settings):</p>
+                      <Wins w={yw} set={(w) => up({ yuni: { ...st.yuni, today: { ...st.yuni.today, [today]: w } } })} />
+                      <p style={{ ...S.muted, marginTop: 10 }}>{plan.best ? `Best shared slot: ${fmt(plan.best[0])} to ${fmt(plan.best[0] + Math.min(CALL.max, plan.best[1] - plan.best[0]))}` : 'No shared slot of 30 minutes yet.'}</p>
+                      <button onClick={() => copy(ask)} style={{ ...S.chip, marginTop: 10, display: 'inline-flex', gap: 6, alignItems: 'center' }}><Copy size={14} /> Copy message to ask Yuni</button>
+                      <div style={{ ...S.row, margin: '12px 0' }}>{[30, 45, 60].map((l) => <Chip key={l} on={cl === l} c="#f29fc0" onClick={() => setCl(l)}>{l} min</Chip>)}</div>
+                      <motion.button whileTap={{ scale: 0.96 }} style={S.btn} onClick={() => startCall(cl)}><Phone size={18} /> Start call now</motion.button>
+                    </>
+                  )}
+                </div>
+
+                <div style={{ ...S.card, padding: 8 }}>
+                  {plan.blocks.map((b) => {
+                    const Ico = IC[b.icon] ?? Sparkles;
+                    const d = isDone(b.id);
                     return (
-                      <motion.div
-                        key={b.task.id}
-                        layout
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: 1 }}
-                        exit={{ opacity: 0 }}
-                        style={{ display: "grid", gap: 4 }}
-                      >
-                        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 13 }}>
-                          <span style={{ ...ellipsis, fontWeight: 600 }}>{b.task.title}{b.fixed ? " (fixed)" : ""}{b.clash ? ", overlaps another fixed task" : ""}</span>
-                          <span style={{ color: C.muted, flexShrink: 0 }}>
-                            {fmtClock(now + b.startMin * 60000)} to {fmtClock(b.endMs)}
-                          </span>
+                      <motion.div layout key={b.id} style={{ display: 'flex', gap: 10, alignItems: 'center', padding: '9px 8px', borderLeft: `3px solid ${kindColor(b)}`, margin: '4px 0', opacity: d ? 0.45 : 1, background: b.warn ? '#3a2523' : 'transparent', borderRadius: 6 }}>
+                        <button aria-label={d ? 'Mark not done' : 'Mark done'} onClick={() => toggle(b.id)} style={{ width: 26, height: 26, borderRadius: 13, border: '2px solid #566086', background: d ? '#8fd0a4' : 'transparent', display: 'grid', placeItems: 'center', cursor: 'pointer', flexShrink: 0, padding: 0 }}>
+                          {d && <Check size={15} color="#10261a" />}
+                        </button>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 15, fontWeight: 600, textDecoration: d ? 'line-through' : 'none' }}>{b.label}</div>
+                          <div style={{ fontSize: 12, color: '#98a1bd' }}>{fmt(b.start)}, {b.dur} min</div>
                         </div>
-                        <div style={{ position: "relative", height: 20, background: C.track, borderRadius: 6, borderLeft: `2px solid ${C.ink}` }}>
-                          <motion.div
-                            initial={false}
-                            animate={{ left: `${left}%`, width: `${Math.min(width, 100 - left)}%` }}
-                            transition={{ type: "spring", stiffness: 160, damping: 26 }}
-                            style={{ position: "absolute", top: 3, bottom: 3, borderRadius: 4, background: color }}
-                          />
-                          {dueLeft !== null && (
-                            <div
-                              title={fmtWhen(b.task, now)}
-                              style={{ position: "absolute", left: `${dueLeft}%`, top: -3, bottom: -3, width: 2, background: b.task.endAt !== null && b.task.endAt < now ? C.red : C.ink }}
-                            />
-                          )}
-                        </div>
+                        <Ico size={18} color="#7d86a8" />
                       </motion.div>
                     );
                   })}
-                </AnimatePresence>
-                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: C.muted, paddingLeft: 2 }}>
-                  {axis.map((t, i) => (
-                    <span key={i}>{i === 0 ? "Now" : fmtClock(t)}</span>
-                  ))}
                 </div>
-              </div>
+              </>
             )}
-          </section>
+          </>
+        )}
 
-          {/* queue */}
-          <section style={card}>
-            <h3 style={h3}>Ranked now</h3>
-            <p style={sub}>Order updates as deadlines get closer. Tap a task to adjust its ratings.</p>
-            <div style={{ display: "grid", gap: 8, marginTop: 14 }}>
-              <AnimatePresence initial={false}>
-                {d.ranked.map((r, i) => {
-                  const isActive = r.task.id === activeRow?.task.id;
-                  const isOpen = openId === r.task.id;
-                  return (
-                    <motion.div
-                      key={r.task.id}
-                      layout
-                      initial={{ opacity: 0, y: 8 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      exit={{ opacity: 0, scale: 0.97 }}
-                      transition={{ type: "spring", stiffness: 300, damping: 30 }}
-                      style={{ border: `1px solid ${isActive ? C.blue : C.line}`, borderRadius: 12, background: "#fff", overflow: "hidden" }}
-                    >
-                      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 10px 10px 14px" }}>
-                        <span style={{ fontFamily: HEAD, fontWeight: 800, fontSize: 18, width: 22, color: i === 0 ? C.blue : C.muted }}>{i + 1}</span>
-                        <button
-                          type="button"
-                          onClick={() => setOpenId(isOpen ? null : r.task.id)}
-                          aria-expanded={isOpen}
-                          style={{ flex: 1, minWidth: 0, textAlign: "left", background: "none", border: "none", padding: "4px 0", cursor: "pointer", fontFamily: BODY, color: C.ink }}
-                        >
-                          <div style={{ ...ellipsis, fontWeight: 600, fontSize: 15 }}>{r.task.title}</div>
-                          <div style={{ fontSize: 12, color: r.missed ? C.red : r.inWindow ? C.teal : C.muted, marginTop: 2 }}>
-                            Score {Math.round(r.score)}, {r.task.estMin} min
-                            {fmtWhen(r.task, now) ? `, ${fmtWhen(r.task, now)}` : ""}
-                            {planProgress(r.task)}
-                          </div>
-                        </button>
-                        {isActive ? (
-                          <Btn icon={<Pause size={18} />} title="Pause" onClick={act.pause} />
-                        ) : (
-                          <Btn icon={<Play size={18} />} title="Start" onClick={() => act.start(r.task.id)} />
-                        )}
-                        <motion.span animate={{ rotate: isOpen ? 180 : 0 }} style={{ display: "inline-flex", color: C.muted }}>
-                          <ChevronDown size={18} />
-                        </motion.span>
-                      </div>
-                      <AnimatePresence initial={false}>
-                        {isOpen && (
-                          <motion.div
-                            initial={{ height: 0, opacity: 0 }}
-                            animate={{ height: "auto", opacity: 1 }}
-                            exit={{ height: 0, opacity: 0 }}
-                            style={{ overflow: "hidden" }}
-                          >
-                            <div style={{ padding: "4px 14px 14px", display: "grid", gap: 12, borderTop: `1px solid ${C.line}` }}>
-                              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 230px), 1fr))", gap: 12, paddingTop: 12 }}>
-                                {RATINGS.map((rt) => (
-                                  <RatingInput
-                                    key={rt.key}
-                                    label={rt.label}
-                                    hint={rt.hint}
-                                    value={r.task[rt.key]}
-                                    onChange={(value) => dispatch({ type: "rate", id: r.task.id, key: rt.key, value })}
-                                  />
-                                ))}
-                              </div>
-                              <StepEditor task={r.task} dispatch={dispatch} />
-                              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                                <Btn icon={<Check size={16} />} onClick={() => act.done(r.task.id)}>Done</Btn>
-                                <Btn icon={<Hourglass size={16} />} onClick={() => act.wait(r.task.id)}>Blocked</Btn>
-                                <Btn variant="danger" icon={<Trash2 size={16} />} onClick={() => act.remove(r.task.id)}>Delete</Btn>
-                              </div>
-                            </div>
-                          </motion.div>
-                        )}
-                      </AnimatePresence>
-                    </motion.div>
-                  );
-                })}
-              </AnimatePresence>
-              {d.ranked.length === 0 && <p style={{ color: C.muted, margin: 0, fontSize: 14 }}>No open tasks.</p>}
+        {tab === 'tasks' && (
+          <>
+            <div style={S.card}>
+              <b style={{ fontSize: 15 }}>Add a task</b>
+              <Lab t="What do you need to do?" />
+              <input style={S.inp} placeholder="Meeting inside school" value={f.title} onChange={(e) => setF({ ...f, title: e.target.value })} />
+              <div style={S.row}>
+                <div style={{ flex: 1 }}><Lab t="Date" /><input type="date" style={S.inp} value={f.date || today} onChange={(e) => setF({ ...f, date: e.target.value })} /></div>
+                <div style={{ flex: 1 }}><Lab t="Start time (empty = flexible)" /><input type="time" style={S.inp} value={f.time} onChange={(e) => setF({ ...f, time: e.target.value })} /></div>
+              </div>
+              <div style={S.row}>
+                <div style={{ flex: 1 }}><Lab t="Estimated minutes" /><input type="number" min={5} style={S.inp} value={f.dur} onChange={(e) => setF({ ...f, dur: +e.target.value || 0 })} /></div>
+                <div style={{ flex: 1 }}><Lab t="Deadline (optional)" /><input type="date" style={S.inp} value={f.deadline} onChange={(e) => setF({ ...f, deadline: e.target.value })} /></div>
+              </div>
+              <Lab t="Priority (5 is highest)" />
+              <div style={S.row}>{[1, 2, 3, 4, 5].map((p) => <Chip key={p} on={f.pri === p} c={PC[p - 1]} onClick={() => setF({ ...f, pri: p })}>{p}</Chip>)}</div>
+              <Lab t="Repeat" />
+              <div style={S.row}>{(['none', 'daily', 'weekly'] as Mode[]).map((m) => <Chip key={m} on={f.repeat === m} onClick={() => setF({ ...f, repeat: m })}>{m === 'none' ? 'Once' : m === 'daily' ? 'Every day' : 'Every week'}</Chip>)}</div>
+              {f.repeat === 'weekly' && (
+                <div style={{ ...S.row, marginTop: 8 }}>
+                  {DAYS.map((d, i) => <Chip key={i} on={f.days.includes(i)} onClick={() => setF({ ...f, days: f.days.includes(i) ? f.days.filter((x) => x !== i) : [...f.days, i] })}>{d}</Chip>)}
+                </div>
+              )}
+              <Lab t="Automatic prep (set once in Settings)" />
+              <select style={S.inp} value={f.prep} onChange={(e) => setF({ ...f, prep: e.target.value })}>
+                <option value="">No prep</option>
+                {st.preps.map((p) => <option key={p.id} value={p.id}>{p.name} ({p.min} min)</option>)}
+              </select>
+              <motion.button whileTap={{ scale: 0.97 }} style={{ ...S.btn, marginTop: 16 }} onClick={addTask}><Plus size={18} /> Add task</motion.button>
             </div>
-          </section>
 
-          {/* scheduled (fixed start in the future) */}
-          {d.upcoming.length > 0 && (
-            <section style={card}>
-              <h3 style={h3}>Scheduled</h3>
-              <p style={sub}>Fixed-time tasks. They join the ranking when their start time arrives.</p>
-              <div style={{ display: "grid", gap: 8, marginTop: 14 }}>
-                {d.upcoming.map((t) => {
-                  const isOpen = openId === t.id;
-                  return (
-                    <div key={t.id} style={{ border: `1px solid ${C.line}`, borderRadius: 12, background: "#fff", overflow: "hidden" }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 10px 10px 14px" }}>
-                        <CalendarClock size={18} color={C.teal} style={{ flexShrink: 0 }} />
-                        <button
-                          type="button"
-                          onClick={() => setOpenId(isOpen ? null : t.id)}
-                          aria-expanded={isOpen}
-                          style={{ flex: 1, minWidth: 0, textAlign: "left", background: "none", border: "none", padding: "4px 0", cursor: "pointer", fontFamily: BODY, color: C.ink }}
-                        >
-                          <div style={{ ...ellipsis, fontWeight: 600, fontSize: 15 }}>{t.title}</div>
-                          <div style={{ fontSize: 12, color: C.teal, marginTop: 2 }}>
-                            {fmtWhen(t, now)}
-                            {planProgress(t)}
-                          </div>
-                        </button>
-                        <Btn icon={<Play size={18} />} title="Start early" onClick={() => act.start(t.id)} />
-                      </div>
-                      {isOpen && (
-                        <div style={{ padding: "4px 14px 14px", display: "grid", gap: 12, borderTop: `1px solid ${C.line}` }}>
-                          <RatingGrid task={t} dispatch={dispatch} />
-                          <StepEditor task={t} dispatch={dispatch} />
-                          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                            <Btn icon={<Check size={16} />} onClick={() => act.done(t.id)}>Done</Btn>
-                            <Btn variant="danger" icon={<Trash2 size={16} />} onClick={() => act.remove(t.id)}>Delete</Btn>
-                          </div>
-                        </div>
-                      )}
+            {st.tasks.length === 0 && <p style={S.muted}>No tasks yet. Add one above and it will appear in your day.</p>}
+            <AnimatePresence>
+              {[...st.tasks].sort((a, b) => b.pri - a.pri).map((t) => (
+                <motion.div key={t.id} layout initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0, x: 40 }} style={{ ...S.card, display: 'flex', gap: 10, alignItems: 'center', borderLeft: `4px solid ${PC[t.pri - 1]}`, padding: 12 }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 700 }}>{t.title}</div>
+                    <div style={{ fontSize: 12, color: '#98a1bd', marginTop: 2 }}>
+                      {t.time ? fmt(toMin(t.time)) : 'Flexible'}, {t.dur} min, priority {t.pri}
+                      {t.repeat === 'daily' ? ', every day' : t.repeat === 'weekly' ? ', every ' + t.days.map((d) => DAYS[d]).join('') : ', ' + t.date}
+                      {t.deadline ? ', due ' + t.deadline : ''}
+                      {st.preps.find((p) => p.id === t.prep) ? ', prep ' + st.preps.find((p) => p.id === t.prep)?.min + ' min' : ''}
                     </div>
-                  );
-                })}
-              </div>
-            </section>
-          )}
+                  </div>
+                  <button aria-label="Delete task" onClick={() => up({ tasks: st.tasks.filter((x) => x.id !== t.id) })} style={{ ...S.chip, padding: 8 }}><Trash2 size={16} /></button>
+                </motion.div>
+              ))}
+            </AnimatePresence>
+          </>
+        )}
 
-          {/* waiting */}
-          <AnimatePresence initial={false}>
-            {d.waiting.length > 0 && (
-              <motion.section
-                key="waiting"
-                layout
-                initial={{ opacity: 0, y: 8 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0 }}
-                style={card}
-              >
-                <h3 style={h3}>Blocked</h3>
-                <p style={sub}>Waiting time counts against you. Follow up, or resume when unblocked.</p>
-                <div style={{ display: "grid", gap: 8, marginTop: 14 }}>
-                  {d.waiting.map((t) => {
-                    const since = state.waits.find((w) => w.taskId === t.id && w.end === null)?.start ?? now;
-                    const long = now - since > 30 * 60000;
-                    return (
-                      <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 10, border: `1px solid ${C.line}`, borderRadius: 12, background: "#fff", padding: "10px 10px 10px 14px" }}>
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={{ ...ellipsis, fontWeight: 600, fontSize: 15 }}>{t.title}</div>
-                          <div style={{ fontSize: 12, color: long ? C.amber : C.muted, marginTop: 2 }}>
-                            Waiting <Live read={(n) => fmtDur(n - since)} every={15000} /> since {fmtClock(since)}
-                          </div>
-                        </div>
-                        <Btn icon={<Play size={16} />} onClick={() => act.unblock(t.id)}>Resume</Btn>
-                        <Btn variant="danger" icon={<Trash2 size={16} />} title="Delete" onClick={() => act.remove(t.id)} />
-                      </div>
-                    );
-                  })}
+        {tab === 'settings' && (
+          <>
+            <div style={S.card}>
+              <b style={{ fontSize: 15 }}>Sleep schedule</b>
+              <div style={S.row}>
+                <div style={{ flex: 1 }}><Lab t="Sleep at" /><input type="time" style={S.inp} value={st.sleep} onChange={(e) => e.target.value && up({ sleep: e.target.value })} /></div>
+                <div style={{ flex: 1 }}><Lab t="Wake at" /><input type="time" style={S.inp} value={st.wake} onChange={(e) => e.target.value && up({ wake: e.target.value })} /></div>
+              </div>
+              <p style={S.muted}>When a task runs late, bedtime moves later automatically, up to 11 pm.</p>
+            </div>
+
+            <div style={S.card}>
+              <b style={{ fontSize: 15 }}>Prep presets</b>
+              <p style={S.muted}>Set once, then attach to any task. The prep block is placed before it automatically.</p>
+              {st.preps.map((p) => (
+                <div key={p.id} style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 10 }}>
+                  <div style={{ flex: 1 }}>{p.name}, {p.min} min</div>
+                  <button aria-label="Delete preset" onClick={() => up({ preps: st.preps.filter((x) => x.id !== p.id) })} style={{ ...S.chip, padding: 8 }}><Trash2 size={16} /></button>
                 </div>
-              </motion.section>
-            )}
-          </AnimatePresence>
-
-          {/* add */}
-          <section style={card}>
-            <h3 style={h3}>Add a task</h3>
-            <form onSubmit={submit} style={{ display: "grid", gap: 14, marginTop: 14 }}>
-              <input
-                value={title}
-                onChange={(e) => setTitle(e.target.value)}
-                placeholder="What needs doing?"
-                aria-label="Task title"
-                style={inputStyle}
-              />
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 200px), 1fr))", gap: 12 }}>
-                <label style={{ display: "grid", gap: 6, fontSize: 13, fontWeight: 600 }}>
-                  Estimate (minutes)
-                  <input type="number" inputMode="numeric" min={5} max={1440} step={5} value={est} onChange={(e) => setEst(e.target.value)} disabled={Boolean(startAt && endAt)} style={{ ...inputStyle, opacity: startAt && endAt ? 0.5 : 1 }} />
-                </label>
-                <label style={{ display: "grid", gap: 6, fontSize: 13, fontWeight: 600 }}>
-                  Starts at (optional)
-                  <input type="datetime-local" value={startAt} onChange={(e) => setStartAt(e.target.value)} style={inputStyle} />
-                </label>
-                <label style={{ display: "grid", gap: 6, fontSize: 13, fontWeight: 600 }}>
-                  Ends by (optional)
-                  <input type="datetime-local" value={endAt} onChange={(e) => setEndAt(e.target.value)} style={inputStyle} />
-                </label>
-                <p style={{ ...sub, margin: 0, gridColumn: "1 / -1" }}>
-                  Set a start time for tasks that only apply at a specific time. Add an end time to make it a window; the estimate then follows the window length.
-                </p>
+              ))}
+              <div style={{ ...S.row, marginTop: 12 }}>
+                <input style={{ ...S.inp, flex: 2 }} placeholder="Going to the gym" value={pf.name} onChange={(e) => setPf({ ...pf, name: e.target.value })} />
+                <input type="number" min={1} style={{ ...S.inp, flex: 1 }} value={pf.min} onChange={(e) => setPf({ ...pf, min: +e.target.value || 0 })} />
               </div>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 230px), 1fr))", gap: 14 }}>
-                {RATINGS.map((rt) => (
-                  <RatingInput
-                    key={rt.key}
-                    label={rt.label}
-                    hint={rt.hint}
-                    value={draft[rt.key]}
-                    onChange={(v) => setDraft((p) => ({ ...p, [rt.key]: v }))}
-                  />
-                ))}
-              </div>
-              <div>
-                {formError && (
-                  <div role="alert" style={{ color: C.red, fontSize: 13, marginBottom: 8 }}>
-                    {formError}
-                  </div>
-                )}
-                <Btn type="submit" variant="solid" icon={<Plus size={18} />}>Add task</Btn>
-              </div>
-            </form>
-          </section>
-
-          {/* finished + log */}
-          <section style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 320px), 1fr))", gap: 12 }}>
-            <div style={card}>
-              <h3 style={h3}>Finished</h3>
-              <div style={{ display: "grid", gap: 6, marginTop: 12 }}>
-                {d.finished.length === 0 && <p style={{ color: C.muted, margin: 0, fontSize: 14 }}>Nothing finished yet.</p>}
-                {d.finished.map((t) => (
-                  <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 14 }}>
-                    <Check size={16} color={C.green} style={{ flexShrink: 0 }} />
-                    <span style={{ ...ellipsis, flex: 1 }}>{t.title}</span>
-                    <span style={{ color: C.muted, fontSize: 12, flexShrink: 0 }}>
-                      {t.doneAt ? fmtClock(t.doneAt) : ""}
-                    </span>
-                    <Btn icon={<Undo2 size={15} />} title="Reopen" onClick={() => act.reopen(t.id)} />
-                  </div>
-                ))}
-              </div>
+              <motion.button whileTap={{ scale: 0.97 }} style={{ ...S.btn, marginTop: 12 }} onClick={addPrep}><Plus size={18} /> Add preset</motion.button>
             </div>
 
-            <div style={card}>
-              <h3 style={h3}>Activity</h3>
-              <div style={{ display: "grid", gap: 6, marginTop: 12, fontSize: 13 }}>
-                {state.log.length === 0 && <p style={{ color: C.muted, margin: 0, fontSize: 14 }}>Every action is timestamped here.</p>}
-                {[...state.log].reverse().slice(0, 10).map((l) => (
-                  <div key={l.id} style={{ display: "flex", gap: 8 }}>
-                    <span style={{ color: C.muted, width: 64, flexShrink: 0 }}>{fmtClock(l.t)}</span>
-                    <span style={{ minWidth: 0, overflowWrap: "anywhere" }}>
-                      {LOG_VERB[l.type]} &ldquo;{l.title}&rdquo;{l.note ? `, ${l.note}` : ""}
-                    </span>
-                  </div>
-                ))}
-              </div>
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 14 }}>
-                <Btn icon={<Download size={16} />} onClick={exportJson}>Export</Btn>
-                <Btn
-                  variant="danger"
-                  icon={<RotateCcw size={16} />}
-                  onClick={() => {
-                    if (window.confirm("Delete all tasks, timers and history on this device?")) dispatch({ type: "reset" });
-                  }}
-                >
-                  Reset
-                </Btn>
-              </div>
+            <div style={S.card}>
+              <b style={{ fontSize: 15 }}>Yuni usual free times</b>
+              <p style={S.muted}>Used to find a shared call slot when you have not set times for today.</p>
+              <Wins w={st.yuni.usual} set={(w) => up({ yuni: { ...st.yuni, usual: w } })} />
             </div>
-          </section>
-        </div>
-      </main>
-    </MotionConfig>
+
+            <div style={S.card}>
+              <b style={{ fontSize: 15 }}>Grooming and recurring care</b>
+              <p style={S.muted}>By weekday, or every N days counted from the last time you checked it off. Empty last done means due now.</p>
+              {st.care.map((c) => (
+                <div key={c.id} style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid #2a3042' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <div style={{ flex: 1, fontSize: 14 }}><b>{c.label}</b>, {c.dur} min, {c.days ? 'every ' + c.days.map((d) => DL[d]).join(', ') : `every ${c.every} days`}, {c.slot === 'shower' ? 'after shower' : 'anytime'}</div>
+                    <button aria-label="Delete care item" onClick={() => up({ care: st.care.filter((x) => x.id !== c.id) })} style={{ ...S.chip, padding: 8 }}><Trash2 size={16} /></button>
+                  </div>
+                  {!c.days && <input type="date" aria-label="Last done" style={{ ...S.inp, marginTop: 8 }} value={c.last ?? ''} onChange={(e) => up({ care: st.care.map((x) => (x.id === c.id ? { ...x, last: e.target.value } : x)) })} />}
+                </div>
+              ))}
+              <Lab t="Add recurring care" />
+              <input style={S.inp} placeholder="Trim eyebrows" value={cf.label} onChange={(e) => setCf({ ...cf, label: e.target.value })} />
+              <div style={{ ...S.row, marginTop: 8 }}>
+                <Chip on={cf.mode === 'every'} onClick={() => setCf({ ...cf, mode: 'every' })}>Every N days</Chip>
+                <Chip on={cf.mode === 'days'} onClick={() => setCf({ ...cf, mode: 'days' })}>Weekdays</Chip>
+              </div>
+              {cf.mode === 'every' ? (
+                <input type="number" min={1} style={{ ...S.inp, marginTop: 8 }} value={cf.every} onChange={(e) => setCf({ ...cf, every: +e.target.value || 0 })} />
+              ) : (
+                <div style={{ ...S.row, marginTop: 8 }}>{DAYS.map((d, i) => <Chip key={i} on={cf.days.includes(i)} onClick={() => setCf({ ...cf, days: cf.days.includes(i) ? cf.days.filter((x) => x !== i) : [...cf.days, i] })}>{d}</Chip>)}</div>
+              )}
+              <div style={S.row}>
+                <div style={{ flex: 1 }}><Lab t="Minutes" /><input type="number" min={1} style={S.inp} value={cf.dur} onChange={(e) => setCf({ ...cf, dur: +e.target.value || 0 })} /></div>
+                <div style={{ flex: 1 }}><Lab t="Last done (optional)" /><input type="date" style={S.inp} value={cf.last} onChange={(e) => setCf({ ...cf, last: e.target.value })} /></div>
+              </div>
+              <div style={{ ...S.row, marginTop: 10 }}>
+                <Chip on={cf.slot === 'shower'} onClick={() => setCf({ ...cf, slot: 'shower' })}>After shower</Chip>
+                <Chip on={cf.slot === 'flex'} onClick={() => setCf({ ...cf, slot: 'flex' })}>Anytime</Chip>
+              </div>
+              <motion.button whileTap={{ scale: 0.97 }} style={{ ...S.btn, marginTop: 14 }} onClick={addCare}><Plus size={18} /> Add care item</motion.button>
+            </div>
+
+            <button style={{ ...S.chip, width: '100%', padding: 12 }} onClick={resetToday}>Reset today and show Start my day again</button>
+          </>
+        )}
+      </div>
+    </div>
   );
 }
-
-const LOG_VERB: Record<LogType, string> = {
-  add: "Added",
-  start: "Started",
-  switch: "Switched to",
-  pause: "Paused",
-  wait: "Blocked on",
-  unblock: "Resumed",
-  done: "Finished",
-  reopen: "Reopened",
-  remove: "Deleted",
-  step: "Completed an action on",
-};
-
-function Metric(p: { label: string; big: string; note: string; tone?: string }) {
-  return (
-    <motion.div layout style={{ ...card, display: "grid", gap: 2 }}>
-      <span style={{ fontSize: 14, fontWeight: 600 }}>{p.label}</span>
-      <motion.span
-        key={p.big}
-        initial={{ opacity: 0.4, y: 4 }}
-        animate={{ opacity: 1, y: 0 }}
-        style={{ fontFamily: HEAD, fontWeight: 800, fontSize: 38, lineHeight: 1.1, color: p.tone ?? C.ink, letterSpacing: "-0.02em" }}
-      >
-        {p.big}
-      </motion.span>
-      <span style={{ fontSize: 13, color: C.muted }}>{p.note}</span>
-    </motion.div>
-  );
-}
-
